@@ -755,8 +755,12 @@ function escapeHtml(text) {
 }
 
 // ── Init ──
-loadRecentJobs();
-loadTemplates();
+// Immediate sync test: if this doesn't change the page, JS isn't running here
+document.getElementById('template-grid').innerHTML = '<p style="color: var(--green);">JS init section reached OK</p>';
+setTimeout(function() {
+  loadRecentJobs();
+  loadTemplates();
+}, 100);
 
 // Auto-poll if viewing a job
 const hash = window.location.hash;
