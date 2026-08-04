@@ -499,6 +499,7 @@
 </div>
 
 <script>
+console.log('Solo Studio JS loaded');
 const API = '/video/api';
 let currentJobId = null;
 let pollTimer = null;
@@ -762,10 +763,11 @@ if (hash && hash.startsWith('#job-')) {
 
 // ── Templates ──
 async function loadTemplates() {
+  const grid = document.getElementById('template-grid');
   try {
     const res = await fetch(API + '/templates');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const templates = await res.json();
-    const grid = document.getElementById('template-grid');
 
     if (!templates.length) {
       grid.innerHTML = '<p style="color: var(--ink-3); grid-column: 1/-1; text-align: center;">No templates available</p>';
@@ -775,8 +777,8 @@ async function loadTemplates() {
     grid.innerHTML = templates.map(t => `
       <div class="template-card" onclick="selectTemplate('${t.id}', this)" data-id="${t.id}">
         <div class="template-category">${t.category}</div>
-        <div class="template-name">${escapeHtml(t.name)}</div>
-        <div class="template-desc">${escapeHtml(t.description)}</div>
+        <div class="template-name">${t.name.replace(/'/g, "\\'")}</div>
+        <div class="template-desc">${t.description.replace(/'/g, "\\'")}</div>
         <div class="template-meta">
           <span>⏱ ${t.duration_minutes} min</span>
           <span>🎬 ${t.platform}</span>
@@ -786,6 +788,7 @@ async function loadTemplates() {
     `).join('');
   } catch (err) {
     console.error('Failed to load templates:', err);
+    grid.innerHTML = '<p style="color: var(--red); grid-column: 1/-1; text-align: center;">Templates unavailable: ' + err.message + '</p>';
   }
 }
 
