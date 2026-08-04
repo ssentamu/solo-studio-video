@@ -1,0 +1,24 @@
+# Solo Studio Video — Long-Form Sample
+# 15-minute deep dive into AI's impact on software engineering
+
+topic: "The End of Junior Developers: How AI Agents Are Reshaping Software Engineering in 2026"
+target_audience: "senior engineers, engineering managers, CTOs, technical founders"
+duration_seconds: 900
+platform: "youtube"
+tone: "educational"
+
+key_messages:
+  - "AI coding agents now autonomously handle 70% of tasks previously assigned to junior developers"
+  - "The economic model shifts: one senior engineer + AI agents replaces a 5-person team at 40% of the cost"
+  - "Code review becomes the new bottleneck — AI writes, humans verify, and this inverts the traditional mentorship pyramid"
+  - "Companies that don't adapt their engineering culture to AI-augmented workflows will lose their best senior talent to those that do"
+  - "The skills that matter in 2026-2027: system design, prompt engineering, AI output evaluation, and architectural thinking"
+
+visual_style: "dark mode tech aesthetic, code on screens, data visualizations, modern workspaces, clean infographics"
+
+call_to_action: "Subscribe and hit the bell for weekly deep dives on AI-powered engineering. Comment below: is your team already using AI agents in production?"
+
+reference_urls:
+  - "https://github.com/features/copilot"
+  - "https://cursor.com"
+  - "https://www.devin.ai"

@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Solo Studio — AI Video Production Pipeline</title>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #14141f;
+    --surface-2: #1e1e2e;
+    --line: #2a2a3a;
+    --ink: #e4e4ec;
+    --ink-2: #9898ac;
+    --ink-3: #58586c;
+    --accent: #7c5cfc;
+    --accent-glow: #7c5cfc33;
+    --green: #34d399;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --radius: 12px;
+
+  --max-w: 720px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .container {
+    width: 100%;
+    max-width: var(--max-w);
+    padding: 40px 20px;
+  }
+  header {
+    text-align: center;
+    margin-bottom: 40px;
+  }
+  header h1 {
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    margin-bottom: 8px;
+  }
+  header p {
+    color: var(--ink-2);
+    font-size: 15px;
+    max-width: 480px;
+    margin: 0 auto;
+  }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 28px;
+    margin-bottom: 20px;
+  }
+  .card h2 {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 20px;
+  }
+
+  /* ── Form ── */
+  .form-group {
+    margin-bottom: 18px;
+  }
+  label {
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ink-2);
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  input, textarea, select {
+    width: 100%;
+    padding: 10px 14px;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    color: var(--ink);
+    font-size: 14px;
+    font-family: inherit;
+    transition: border-color 0.2s;
+  }
+  input:focus, textarea:focus, select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+  textarea {
+    resize: vertical;
+    min-height: 80px;
+  }
+  .row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+  }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 28px;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.1s;
+  }
+  .btn:hover { background: #6d4eeb; }
+  .btn:active { transform: scale(0.98); }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn-secondary {
+    background: var(--surface-2);
+    color: var(--ink);
+    border: 1px solid var(--line);
+  }
+  .btn-secondary:hover { background: var(--line); }
+
+  /* ── Progress ── */
+  .progress-bar {
+    height: 6px;
+    background: var(--surface-2);
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 16px 0;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 3px;
+    transition: width 0.4s ease;
+  }
+  .stage-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    color: var(--ink-2);
+  }
+  .stage-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--ink-3);
+  }
+  .stage-dot.active { background: var(--accent); box-shadow: 0 0 8px var(--accent-glow); }
+  .stage-dot.done { background: var(--green); }
+
+  /* ── Stats ── */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-top: 20px;
+  }
+  .stat {
+    background: var(--surface-2);
+    border-radius: 8px;
+    padding: 14px;
+    text-align: center;
+  }
+  .stat-value {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .stat-label {
+    font-size: 11px;
+    color: var(--ink-2);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 4px;
+  }
+
+  /* ── Download ── */
+  .download-card {
+    text-align: center;
+    padding: 40px 28px;
+  }
+  .download-card .check {
+    font-size: 48px;
+    margin-bottom: 16px;
+  }
+  .pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: center;
+    margin: 20px 0;
+  }
+  .pill {
+    padding: 4px 12px;
+    background: var(--surface-2);
+    border-radius: 20px;
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+  .pill.ok { color: var(--green); }
+
+  /* ── Stage Pipeline ── */
+  .pipeline {
+    display: flex;
+    gap: 6px;
+    margin: 16px 0 24px;
+  }
+  .pipeline-step {
+    flex: 1;
+    height: 4px;
+    background: var(--surface-2);
+    border-radius: 2px;
+    transition: background 0.3s;
+  }
+  .pipeline-step.done { background: var(--green); }
+  .pipeline-step.active { background: var(--accent); }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+  .spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--ink-3);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  .hidden { display: none; }
+  .text-center { text-align: center; }
+  .mt-12 { margin-top: 12px; }
+  .mt-20 { margin-top: 20px; }
+
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .badge-queued { background: var(--surface-2); color: var(--ink-2); }
+  .badge-running { background: #7c5cfc22; color: var(--accent); }
+  .badge-completed { background: #34d39922; color: var(--green); }
+  .badge-failed { background: #f8717122; color: var(--red); }
+
+  .recent-jobs {
+    margin-top: 30px;
+  }
+  .job-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px;
+    background: var(--surface-2);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .job-item:hover { background: var(--line); }
+  .job-topic {
+    font-size: 14px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 400px;
+  }
+  .job-meta {
+    font-size: 12px;
+    color: var(--ink-2);
+    margin-top: 2px;
+  }
+
+  /* ── Templates ── */
+  .template-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin-bottom: 20px;
+  }
+  .template-card {
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 14px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .template-card:hover {
+    border-color: var(--accent);
+    background: var(--surface);
+  }
+  .template-card.selected {
+    border-color: var(--accent);
+    background: #7c5cfc11;
+  }
+  .template-name {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .template-category {
+    font-size: 10px;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .template-desc {
+    font-size: 12px;
+    color: var(--ink-2);
+    margin-top: 6px;
+    line-height: 1.4;
+  }
+  .template-meta {
+    font-size: 11px;
+    color: var(--ink-3);
+    margin-top: 8px;
+  }
+  .template-meta span {
+    margin-right: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- ── Header ── -->
+  <header>
+    <h1>Solo Studio</h1>
+    <p>AI video production pipeline. Create complete video packages — script, visuals, voiceover, music — from a single brief.</p>
+  </header>
+
+  <!-- ── VIEW 1: New Job Form ── -->
+  <div id="view-form">
+
+    <!-- Template Picker -->
+    <div class="card">
+      <h2>Start from a Template</h2>
+      <p style="color: var(--ink-2); font-size: 13px; margin-bottom: 16px;">Click a template to pre-fill the form, or build your own below.</p>
+      <div class="template-grid" id="template-grid">
+        <p style="color: var(--ink-3); grid-column: 1/-1; text-align: center;">Loading templates...</p>
+      </div>
+    </div>
+
+    <!-- Custom Form -->
+    <div class="card">
+      <h2>Create a Video</h2>
+      <form id="brief-form">
+        <div class="form-group">
+          <label>Topic</label>
+          <input type="text" id="topic" placeholder="What's your video about?" required>
+        </div>
+        <div class="form-group">
+          <label>Target Audience</label>
+          <input type="text" id="audience" placeholder="e.g. senior engineers, founders, general audience" value="general">
+        </div>
+        <div class="row">
+          <div class="form-group">
+            <label>Duration (minutes)</label>
+            <input type="number" id="duration" placeholder="10" value="10" min="0.5" max="90" step="0.5" required>
+          </div>
+          <div class="form-group">
+            <label>Platform</label>
+            <select id="platform">
+              <option value="youtube">YouTube</option>
+              <option value="tiktok">TikTok</option>
+              <option value="instagram">Instagram</option>
+              <option value="linkedin">LinkedIn</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Tone</label>
+          <select id="tone">
+            <option value="educational">Educational</option>
+            <option value="professional">Professional</option>
+            <option value="cinematic">Cinematic</option>
+            <option value="energetic">Energetic</option>
+            <option value="casual">Casual</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Key Messages (one per line)</label>
+          <textarea id="messages" placeholder="AI handles 70% of junior dev tasks&#10;Cost drops to 1/10th&#10;Teams ship 3x faster"></textarea>
+        </div>
+        <div class="form-group">
+          <label>Visual Style</label>
+          <input type="text" id="visual-style" placeholder="e.g. dark mode tech, clean infographics, cinematic documentary">
+        </div>
+        <div class="form-group">
+          <label>Call to Action</label>
+          <input type="text" id="cta" placeholder="e.g. Subscribe for weekly deep dives">
+        </div>
+        <button type="submit" class="btn" id="submit-btn">
+          <span>Generate Video Package</span>
+        </button>
+      </form>
+    </div>
+
+    <!-- Recent Jobs -->
+    <div class="recent-jobs card">
+      <h2>Recent Jobs</h2>
+      <div id="recent-jobs-list">
+        <p style="color: var(--ink-3); text-align: center;">No jobs yet</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── VIEW 2: Job In Progress ── -->
+  <div id="view-job" class="hidden">
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 16px;">
+        <h2 id="job-topic-display" style="margin-bottom: 0;">Loading...</h2>
+        <span class="badge" id="job-badge">queued</span>
+      </div>
+
+      <div class="progress-bar">
+        <div class="progress-fill" id="progress-fill" style="width: 0%"></div>
+      </div>
+
+      <div class="stage-label" style="margin-bottom: 16px;">
+        <span class="spinner" id="stage-spinner"></span>
+        <span id="stage-text">Waiting to start...</span>
+        <span style="margin-left: auto; color: var(--ink-3);" id="progress-pct">0%</span>
+      </div>
+
+      <!-- Pipeline steps -->
+      <div class="pipeline" id="pipeline-steps">
+        <div class="pipeline-step"></div><div class="pipeline-step"></div>
+        <div class="pipeline-step"></div><div class="pipeline-step"></div>
+        <div class="pipeline-step"></div><div class="pipeline-step"></div>
+        <div class="pipeline-step"></div><div class="pipeline-step"></div>
+        <div class="pipeline-step"></div>
+      </div>
+
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-value" id="stat-format">—</div>
+          <div class="stat-label">Format</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="stat-chapters">—</div>
+          <div class="stat-label">Chapters</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="stat-scenes">—</div>
+          <div class="stat-label">Scenes</div>
+        </div>
+      </div>
+
+      <div id="job-error" class="hidden" style="margin-top: 16px; padding: 12px; background: #f8717122; border-radius: 8px; color: var(--red); font-size: 14px;"></div>
+    </div>
+
+    <div class="text-center hidden" id="back-btn-container">
+      <button class="btn btn-secondary" onclick="showView('form')">← New Video</button>
+    </div>
+  </div>
+
+  <!-- ── VIEW 3: Download ── -->
+  <div id="view-download" class="hidden">
+    <div class="card download-card">
+      <div class="check">✓</div>
+      <h2>Package Ready</h2>
+      <p style="color: var(--ink-2); margin: 12px 0 20px; font-size: 14px;">
+        Your video production package has been generated. Download includes:
+      </p>
+
+      <div class="pills" id="artifact-pills"></div>
+
+      <div class="stats" id="download-stats"></div>
+
+      <div class="mt-20" style="display: flex; gap: 12px; justify-content: center;">
+        <a id="download-link" class="btn" href="#" download>
+          <span>⬇ Download Package (.zip)</span>
+        </a>
+        <button class="btn btn-secondary" onclick="showView('form')">Create Another</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const API = '/video/api';
+let currentJobId = null;
+let pollTimer = null;
+
+// ── View switching ──
+function showView(view) {
+  document.getElementById('view-form').classList.toggle('hidden', view !== 'form');
+  document.getElementById('view-job').classList.toggle('hidden', view !== 'job');
+  document.getElementById('view-download').classList.toggle('hidden', view !== 'download');
+
+  if (view === 'form' && pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    loadRecentJobs();
+  }
+}
+
+// ── Form submit ──
+document.getElementById('brief-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById('submit-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Creating...';
+
+  const messages = document.getElementById('messages').value
+    .split('\n')
+    .map(m => m.trim())
+    .filter(m => m.length > 0);
+
+  const body = {
+    topic: document.getElementById('topic').value,
+    target_audience: document.getElementById('audience').value,
+    duration_minutes: parseFloat(document.getElementById('duration').value),
+    platform: document.getElementById('platform').value,
+    tone: document.getElementById('tone').value,
+    key_messages: messages,
+    visual_style: document.getElementById('visual-style').value,
+    call_to_action: document.getElementById('cta').value,
+  };
+
+  try {
+    const res = await fetch(API + '/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) throw new Error('Failed to create job');
+
+    const job = await res.json();
+    currentJobId = job.id;
+    showView('job');
+    pollJob();
+  } catch (err) {
+    alert('Error: ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<span>Generate Video Package</span>';
+  }
+});
+
+// ── Poll job status ──
+function pollJob() {
+  if (!currentJobId) return;
+
+  pollTimer = setInterval(async () => {
+    try {
+      const res = await fetch(API + '/jobs/' + currentJobId);
+      const job = await res.json();
+      updateJobView(job);
+
+      if (job.status === 'completed') {
+        clearInterval(pollTimer);
+        showDownloadView(job);
+      } else if (job.status === 'failed') {
+        clearInterval(pollTimer);
+      }
+
+      // Also update recent jobs in background
+      loadRecentJobs();
+    } catch (err) {
+      console.error('Poll error:', err);
+    }
+  }, 1500);
+}
+
+function updateJobView(job) {
+  document.getElementById('job-topic-display').textContent = job.topic;
+  document.getElementById('progress-fill').style.width = (job.progress * 100) + '%';
+  document.getElementById('progress-pct').textContent = Math.round(job.progress * 100) + '%';
+  document.getElementById('stage-text').textContent = formatStage(job.stage);
+
+  // Badge
+  const badge = document.getElementById('job-badge');
+  badge.textContent = job.status;
+  badge.className = 'badge badge-' + job.status;
+
+  // Spinner
+  const spin = document.getElementById('stage-spinner');
+  spin.style.display = job.status === 'completed' || job.status === 'failed' ? 'none' : 'inline-block';
+
+  // Stats
+  document.getElementById('stat-format').textContent = job.format || '—';
+  document.getElementById('stat-chapters').textContent = job.chapters || '—';
+  document.getElementById('stat-scenes').textContent = job.scenes || '—';
+
+  // Pipeline steps
+  const stages = ['research', 'script', 'visuals', 'voiceover', 'video_prompts', 'music', 'captions', 'editor_export', 'assembly'];
+  const currentIdx = stages.indexOf(job.stage);
+  const steps = document.getElementById('pipeline-steps').children;
+  for (let i = 0; i < steps.length; i++) {
+    steps[i].className = 'pipeline-step';
+    if (job.status === 'completed') {
+      steps[i].classList.add('done');
+    } else if (currentIdx >= 0 && i < currentIdx) {
+      steps[i].classList.add('done');
+    } else if (i === currentIdx && job.status === 'running') {
+      steps[i].classList.add('active');
+    }
+  }
+
+  // Error
+  const errEl = document.getElementById('job-error');
+  if (job.error) {
+    errEl.textContent = job.error;
+    errEl.classList.remove('hidden');
+  } else {
+    errEl.classList.add('hidden');
+  }
+
+  // Show back button
+  document.getElementById('back-btn-container').classList.toggle(
+    'hidden',
+    job.status === 'running' || job.status === 'queued'
+  );
+}
+
+function formatStage(stage) {
+  const names = {
+    research: 'Researching topic & audience...',
+    script: 'Writing script & storyboard...',
+    visuals: 'Generating scene visuals...',
+    voiceover: 'Creating voiceover track...',
+    video_prompts: 'Preparing video generation prompts...',
+    music: 'Composing background music...',
+    captions: 'Generating captions...',
+    editor_export: 'Exporting editor project file...',
+    assembly: 'Assembling final package...',
+    done: 'Complete!',
+  };
+  return names[stage] || stage;
+}
+
+function showDownloadView(job) {
+  showView('download');
+
+  // Artifact pills
+  const pills = document.getElementById('artifact-pills');
+  const items = [
+    { label: 'Creative Brief', ok: true },
+    { label: 'Full Script', ok: true },
+    { label: 'Storyboard', ok: true },
+    { label: 'Scene Images', ok: job.has_visuals },
+    { label: 'Voiceover', ok: job.has_voiceover },
+    { label: 'Video Prompts', ok: true },
+    { label: 'Music Prompt', ok: true },
+    { label: 'Captions (.srt)', ok: true },
+    { label: 'Assembly Manifest', ok: true },
+  ];
+  pills.innerHTML = items.map(i =>
+    `<span class="pill${i.ok ? ' ok' : ''}">${i.ok ? '✓' : '○'} ${i.label}</span>`
+  ).join('');
+
+  // Stats
+  document.getElementById('download-stats').innerHTML = `
+    <div class="stat">
+      <div class="stat-value">${job.scenes || '—'}</div>
+      <div class="stat-label">Scenes</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">${job.chapters || '—'}</div>
+      <div class="stat-label">Chapters</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">${Math.round(job.duration_seconds / 60) || '—'}m</div>
+      <div class="stat-label">Duration</div>
+    </div>
+  `;
+
+  document.getElementById('download-link').href = API + '/jobs/' + job.id + '/download';
+}
+
+// ── Recent jobs ──
+async function loadRecentJobs() {
+  try {
+    const res = await fetch(API + '/jobs?limit=10');
+    const jobs = await res.json();
+
+    const list = document.getElementById('recent-jobs-list');
+    if (!jobs.length) {
+      list.innerHTML = '<p style="color: var(--ink-3); text-align: center;">No jobs yet</p>';
+      return;
+    }
+
+    list.innerHTML = jobs.map(j => `
+      <div class="job-item" onclick="viewJob('${j.id}')">
+        <div style="flex: 1; min-width: 0;">
+          <div class="job-topic">${escapeHtml(j.topic)}</div>
+          <div class="job-meta">${Math.round(j.duration_seconds / 60)}m · ${j.scenes || 0} scenes · ${j.format || 'pending'}</div>
+        </div>
+        <span class="badge badge-${j.status}">${j.status}</span>
+      </div>
+    `).join('');
+  } catch (err) {
+    console.error('Failed to load recent jobs:', err);
+  }
+}
+
+function viewJob(jobId) {
+  currentJobId = jobId;
+  showView('job');
+  loadJobStatus(jobId);
+}
+
+async function loadJobStatus(jobId) {
+  try {
+    const res = await fetch(API + '/jobs/' + jobId);
+    const job = await res.json();
+    updateJobView(job);
+
+    if (job.status === 'completed') {
+      showDownloadView(job);
+      showView('download');
+    } else if (job.status === 'running' || job.status === 'queued') {
+      pollJob();
+    } else {
+      document.getElementById('back-btn-container').classList.remove('hidden');
+    }
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// ── Init ──
+loadRecentJobs();
+loadTemplates();
+
+// Auto-poll if viewing a job
+const hash = window.location.hash;
+if (hash && hash.startsWith('#job-')) {
+  const jobId = hash.replace('#job-', '');
+  viewJob(jobId);
+}
+
+
+// ── Templates ──
+async function loadTemplates() {
+  try {
+    const res = await fetch(API + '/templates');
+    const templates = await res.json();
+    const grid = document.getElementById('template-grid');
+
+    if (!templates.length) {
+      grid.innerHTML = '<p style="color: var(--ink-3); grid-column: 1/-1; text-align: center;">No templates available</p>';
+      return;
+    }
+
+    grid.innerHTML = templates.map(t => `
+      <div class="template-card" onclick="selectTemplate('${t.id}', this)" data-id="${t.id}">
+        <div class="template-category">${t.category}</div>
+        <div class="template-name">${escapeHtml(t.name)}</div>
+        <div class="template-desc">${escapeHtml(t.description)}</div>
+        <div class="template-meta">
+          <span>⏱ ${t.duration_minutes} min</span>
+          <span>🎬 ${t.platform}</span>
+          <span>🎯 ${t.tone}</span>
+        </div>
+      </div>
+    `).join('');
+  } catch (err) {
+    console.error('Failed to load templates:', err);
+  }
+}
+
+function selectTemplate(templateId, el) {
+  // Deselect all
+  document.querySelectorAll('.template-card').forEach(c => c.classList.remove('selected'));
+  // Select this one
+  el.classList.add('selected');
+
+  // Fetch template details
+  fetch(API + '/templates')
+    .then(r => r.json())
+    .then(templates => {
+      const t = templates.find(t => t.id === templateId);
+      if (!t) return;
+
+      document.getElementById('topic').value = t.topic;
+      document.getElementById('audience').value = t.target_audience;
+      document.getElementById('duration').value = t.duration_minutes;
+      document.getElementById('platform').value = t.platform;
+      document.getElementById('tone').value = t.tone;
+      document.getElementById('messages').value = (t.key_messages || []).join('\n');
+      document.getElementById('visual-style').value = t.visual_style || '';
+      document.getElementById('cta').value = t.call_to_action || '';
+
+      // Also add a quick-start button
+      let btnRow = document.getElementById('quick-start-row');
+      if (!btnRow) {
+        btnRow = document.createElement('div');
+        btnRow.id = 'quick-start-row';
+        btnRow.style.cssText = 'margin-top: 8px;';
+        btnRow.innerHTML = `<button class="btn" onclick="quickStart('${templateId}'); return false;" style="width:100%">
+          ⚡ Generate from Template — "${escapeHtml(t.name)}"
+        </button>`;
+        document.getElementById('submit-btn').parentNode.appendChild(btnRow);
+      } else {
+        btnRow.querySelector('button').textContent = `⚡ Generate from Template — "${escapeHtml(t.name)}"`;
+        btnRow.querySelector('button').onclick = () => { quickStart(templateId); return false; };
+      }
+    });
+}
+
+async function quickStart(templateId) {
+  const btn = document.querySelector('#quick-start-row button');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Creating...';
+  }
+
+  try {
+    const res = await fetch(API + '/jobs/from-template/' + templateId, { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to create job');
+    const job = await res.json();
+    currentJobId = job.id;
+    showView('job');
+    pollJob();
+  } catch (err) {
+    alert('Error: ' + err.message);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = btn.textContent.replace('Creating...', 'Generate');
+    }
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# Solo Studio Video — Sample Brief
+# A 60-second product explainer for a fictional AI tool
+
+topic: "How AI Agents Are Replacing Junior Developers"
+target_audience: "technical founders and engineering leads"
+duration_seconds: 60
+platform: "youtube"
+tone: "educational"
+
+key_messages:
+  - "AI coding agents now handle 70% of junior dev tasks at 1/10th the cost"
+  - "The bottleneck shifts from writing code to reviewing and directing AI output"
+  - "Teams that embrace this shift ship 3x faster with the same headcount"
+
+visual_style: "clean tech aesthetic, dark mode screens, code scrolling on screens, modern office setting"
+
+call_to_action: "Subscribe for weekly insights on AI-powered engineering."
+
+reference_urls:
+  - "https://github.com/features/copilot"

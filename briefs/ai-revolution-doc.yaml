@@ -1,0 +1,18 @@
+# Solo Studio Video — Documentary Format Test
+# 45-minute episode
+
+topic: "The AI Revolution in Software: A Complete History 2020-2026"
+target_audience: "general tech audience, developers, product managers, investors"
+duration_seconds: 2700
+platform: "youtube"
+tone: "cinematic"
+
+key_messages:
+  - "GPT-3's release in 2020 was the spark that ignited the current AI revolution"
+  - "GitHub Copilot transformed from a curiosity to an essential tool in under 2 years"
+  - "The shift from code completion to autonomous agents happened faster than anyone predicted"
+  - "AI coding tools have created a new class of '10x developer' — but the definition has changed"
+
+visual_style: "cinematic documentary style, archival footage aesthetic, timeline animations, interview setups"
+
+call_to_action: "Subscribe for more documentary-style deep dives. What topic should we cover next?"
