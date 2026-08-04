@@ -769,10 +769,16 @@ if (hash && hash.startsWith('#job-')) {
 // ── Templates ──
 async function loadTemplates() {
   const grid = document.getElementById('template-grid');
+  grid.innerHTML = '<p style="color: var(--yellow);">Loading templates (step 1: starting)...</p>';
   try {
-    const res = await fetch(API + '/templates');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const templates = await res.json();
+    const url = API + '/templates';
+    grid.innerHTML = '<p style="color: var(--yellow);">Loading templates (step 2: fetching ' + url + ')...</p>';
+    const res = await fetch(url);
+    grid.innerHTML = '<p style="color: var(--yellow);">Loading templates (step 3: status ' + res.status + ')...</p>';
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const text = await res.text();
+    grid.innerHTML = '<p style="color: var(--yellow);">Loading templates (step 4: parsed ' + text.length + ' bytes)...</p>';
+    const templates = JSON.parse(text);
 
     if (!templates.length) {
       grid.innerHTML = '<p style="color: var(--ink-3); grid-column: 1/-1; text-align: center;">No templates available</p>';
