@@ -8,18 +8,24 @@ import json, subprocess, sys, time, shutil
 from pathlib import Path
 from datetime import datetime
 
-OUTPUT_ROOT = Path("/opt/data/solo-studio-video/output")
-JOBS_FILE = Path("/opt/data/solo-studio-video/jobs.json")
-ENGINES_DIR = Path("/opt/data/solo-studio-video/engines")
-PIPELINE = Path("/opt/data/solo-studio-video/pipeline.py")
+APP_DIR = Path(__file__).resolve().parent
+OUTPUT_ROOT = APP_DIR / "output"
+JOBS_FILE = APP_DIR / "jobs.json"
+ENGINES_DIR = APP_DIR / "engines"
+PIPELINE = APP_DIR / "pipeline.py"
 
 POLL_INTERVAL = 2  # seconds
 
 
 def load_jobs() -> dict:
     if JOBS_FILE.exists():
-        with open(JOBS_FILE) as f:
-            return json.load(f)
+        try:
+            with open(JOBS_FILE) as f:
+                content = f.read().strip()
+                if content:
+                    return json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            pass
     return {}
 
 

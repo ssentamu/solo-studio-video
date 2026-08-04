@@ -18,10 +18,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
-# ── Config ──
-OUTPUT_ROOT = Path("/opt/data/solo-studio-video/output")
-JOBS_FILE = Path("/opt/data/solo-studio-video/jobs.json")
-FRONTEND_DIR = Path("/opt/data/solo-studio-video/frontend")
+# ── Config — auto-detect base dir (works in Docker and local) ──
+APP_DIR = Path(__file__).resolve().parent
+OUTPUT_ROOT = APP_DIR / "output"
+JOBS_FILE = APP_DIR / "jobs.json"
+FRONTEND_DIR = APP_DIR / "frontend"
 
 app = FastAPI(title="Solo Studio API", version="1.0")
 
@@ -65,8 +66,13 @@ class JobStatus(BaseModel):
 # ── Job store (in-memory + JSON file for persistence) ──
 def _load_jobs() -> dict:
     if JOBS_FILE.exists():
-        with open(JOBS_FILE) as f:
-            return json.load(f)
+        try:
+            with open(JOBS_FILE) as f:
+                content = f.read().strip()
+                if content:
+                    return json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            pass
     return {}
 
 
