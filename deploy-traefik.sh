@@ -19,6 +19,10 @@ echo "=== Deploying on edgescout.tech/video ==="
 # Remove old container
 docker rm -f solo-studio-video 2>/dev/null || true
 
+# Ensure jobs.json exists with correct ownership
+touch "$APP_DIR/jobs.json"
+chmod 666 "$APP_DIR/jobs.json"
+
 # Launch with nginx on port 9091 (FastAPI on 8000 internally)
 docker run -d \
   --name solo-studio-video \
