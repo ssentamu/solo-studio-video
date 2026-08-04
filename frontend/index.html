@@ -346,6 +346,9 @@
   <header>
     <h1>Solo Studio</h1>
     <p>AI video production pipeline. Create complete video packages — script, visuals, voiceover, music — from a single brief.</p>
+    <div id="js-test" style="background:#f8717133;color:#f87171;padding:8px 16px;border-radius:8px;margin-top:12px;font-size:13px;">
+      ⚠ JavaScript is not running. Check browser console for errors.
+    </div>
   </header>
 
   <!-- ── VIEW 1: New Job Form ── -->
@@ -500,6 +503,8 @@
 
 <script>
 console.log('Solo Studio JS loaded');
+// Hide JS warning banner — proves JS is executing
+document.getElementById('js-test').style.display = 'none';
 const API = '/video/api';
 let currentJobId = null;
 let pollTimer = null;
