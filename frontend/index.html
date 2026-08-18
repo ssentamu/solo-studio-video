@@ -377,6 +377,13 @@
       <h2>Create a Video</h2>
       <form id="brief-form">
         <div class="form-group">
+          <label>Operator API Token</label>
+          <input type="password" id="api-token" autocomplete="off" placeholder="Required when production API auth is enabled">
+          <p style="color: var(--ink-3); font-size: 12px; margin-top: 6px;">
+            Stored only for this browser session. Health/templates stay public; job creation, status, and downloads can be token-gated.
+          </p>
+        </div>
+        <div class="form-group">
           <label>Topic</label>
           <input type="text" id="topic" placeholder="What's your video about?" required>
         </div>
@@ -507,9 +514,9 @@
       <div class="stats" id="download-stats"></div>
 
       <div class="mt-20" style="display: flex; gap: 12px; justify-content: center;">
-        <a id="download-link" class="btn" href="#" download>
+        <button id="download-btn" class="btn" type="button">
           <span>⬇ Download Package (.zip)</span>
-        </a>
+        </button>
         <button class="btn btn-secondary" onclick="showView('form')">Create Another</button>
       </div>
     </div>
@@ -522,8 +529,54 @@ console.log('Solo Studio JS loaded');
 // Hide JS warning banner — proves JS is executing
 document.getElementById('js-test').style.display = 'none';
 const API = '/video/api';
+const API_TOKEN_STORAGE_KEY = 'soloStudioApiToken';
 let currentJobId = null;
 let pollTimer = null;
+
+function getApiToken() {
+  const input = document.getElementById('api-token');
+  return String((input && input.value) || sessionStorage.getItem(API_TOKEN_STORAGE_KEY) || '').trim();
+}
+
+function persistApiToken() {
+  const token = getApiToken();
+  if (token) {
+    sessionStorage.setItem(API_TOKEN_STORAGE_KEY, token);
+  } else {
+    sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+  }
+  return token;
+}
+
+function protectedFetch(path, options = {}) {
+  const headers = new Headers(options.headers || {});
+  const token = getApiToken();
+  if (token) {
+    headers.set('Authorization', 'Bearer ' + token);
+  }
+  return fetch(API + path, { ...options, headers });
+}
+
+async function requireOk(res, action) {
+  if (res.ok) return res;
+  let detail = '';
+  try {
+    const body = await res.json();
+    detail = body.detail ? ': ' + body.detail : '';
+  } catch (_) {}
+  if (res.status === 401) {
+    throw new Error('API token required. Enter the operator token and retry.');
+  }
+  throw new Error(action + ' failed with HTTP ' + res.status + detail);
+}
+
+function initApiTokenControl() {
+  const input = document.getElementById('api-token');
+  if (!input) return;
+  input.value = sessionStorage.getItem(API_TOKEN_STORAGE_KEY) || '';
+  input.addEventListener('change', persistApiToken);
+  input.addEventListener('blur', persistApiToken);
+}
 
 // ── View switching ──
 function showView(view) {
@@ -562,13 +615,14 @@ document.getElementById('brief-form').addEventListener('submit', async (e) => {
   };
 
   try {
-    const res = await fetch(API + '/jobs', {
+    persistApiToken();
+    const res = await protectedFetch('/jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
 
-    if (!res.ok) throw new Error('Failed to create job');
+    await requireOk(res, 'Create job');
 
     const job = await res.json();
     currentJobId = job.id;
@@ -588,7 +642,8 @@ function pollJob() {
 
   pollTimer = setInterval(async () => {
     try {
-      const res = await fetch(API + '/jobs/' + currentJobId);
+      const res = await protectedFetch('/jobs/' + currentJobId);
+      await requireOk(res, 'Poll job');
       const job = await res.json();
       updateJobView(job);
 
@@ -725,13 +780,19 @@ function showDownloadView(job) {
     </div>
   `;
 
-  document.getElementById('download-link').href = API + '/jobs/' + job.id + '/download';
+  const downloadBtn = document.getElementById('download-btn');
+  downloadBtn.dataset.jobId = job.id;
 }
 
 // ── Recent jobs ──
 async function loadRecentJobs() {
   try {
-    const res = await fetch(API + '/jobs?limit=10');
+    const res = await protectedFetch('/jobs?limit=10');
+    if (res.status === 401) {
+      document.getElementById('recent-jobs-list').innerHTML = '<p style="color: var(--yellow); text-align: center;">Enter the operator API token to load recent jobs.</p>';
+      return;
+    }
+    await requireOk(res, 'Load recent jobs');
     const jobs = await res.json();
 
     const list = document.getElementById('recent-jobs-list');
@@ -765,7 +826,8 @@ function viewJob(jobId) {
 
 async function loadJobStatus(jobId) {
   try {
-    const res = await fetch(API + '/jobs/' + jobId);
+    const res = await protectedFetch('/jobs/' + jobId);
+    await requireOk(res, 'Load job status');
     const job = await res.json();
     updateJobView(job);
 
@@ -804,6 +866,11 @@ function packageStatusNote(status) {
     failed: 'Package status: failed — partial artifacts may still be present.',
   };
   return notes[status] || ('Package status: ' + status);
+}
+
+function filenameFromDisposition(disposition, fallback) {
+  const match = /filename="?([^";]+)"?/i.exec(disposition || '');
+  return match ? match[1] : fallback;
 }
 
 // ── Init ──
@@ -904,8 +971,9 @@ async function quickStart(templateId) {
   }
 
   try {
-    const res = await fetch(API + '/jobs/from-template/' + encodeURIComponent(templateId), { method: 'POST' });
-    if (!res.ok) throw new Error('Failed to create job');
+    persistApiToken();
+    const res = await protectedFetch('/jobs/from-template/' + encodeURIComponent(templateId), { method: 'POST' });
+    await requireOk(res, 'Create job from template');
     const job = await res.json();
     currentJobId = job.id;
     showView('job');
@@ -918,6 +986,36 @@ async function quickStart(templateId) {
     }
   }
 }
+
+document.getElementById('download-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('download-btn');
+  const jobId = btn.dataset.jobId || currentJobId;
+  if (!jobId) return;
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Preparing download...';
+  try {
+    persistApiToken();
+    const res = await protectedFetch('/jobs/' + encodeURIComponent(jobId) + '/download');
+    await requireOk(res, 'Download package');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filenameFromDisposition(res.headers.get('Content-Disposition'), 'solo-studio-' + safeClassToken(jobId) + '.zip');
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    alert('Download failed: ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+});
+
+initApiTokenControl();
 </script>
 </body>
 </html>

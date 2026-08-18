@@ -5,6 +5,15 @@
 set -euo pipefail
 
 APP_DIR=/docker/hermes-agent-r0tv/data/solo-studio-video
+: "${SOLO_STUDIO_API_TOKEN:?Set SOLO_STUDIO_API_TOKEN in the shell before deploying Solo Studio Video}"
+SOLO_STUDIO_CORS_ORIGINS=${SOLO_STUDIO_CORS_ORIGINS:-https://edgescout.tech}
+curl_config=""
+cleanup() {
+  if [ -n "$curl_config" ]; then
+    rm -f "$curl_config"
+  fi
+}
+trap cleanup EXIT
 
 echo "=== Building Solo Studio Video ==="
 cd "$APP_DIR"
@@ -28,6 +37,9 @@ docker run -d \
   --name solo-studio-video \
   --network host \
   --restart unless-stopped \
+  -e SOLO_STUDIO_API_TOKEN \
+  -e SOLO_STUDIO_REQUIRE_API_TOKEN=1 \
+  -e SOLO_STUDIO_CORS_ORIGINS="$SOLO_STUDIO_CORS_ORIGINS" \
   -v "$APP_DIR/output:/app/output" \
   -v "$APP_DIR/jobs.json:/app/jobs.json" \
   -l "traefik.enable=true" \
@@ -53,6 +65,10 @@ echo ""
 echo "=== Smoke test ==="
 curl -sSI https://edgescout.tech/video/ 2>&1 | head -5
 curl -fsS https://edgescout.tech/video/api/health 2>&1
+curl_config=$(mktemp)
+chmod 600 "$curl_config"
+printf 'header = "Authorization: Bearer %s"\n' "$SOLO_STUDIO_API_TOKEN" > "$curl_config"
+curl -fsS --config "$curl_config" "https://edgescout.tech/video/api/jobs?limit=1" >/dev/null
 
 echo ""
 echo "=== URL ==="

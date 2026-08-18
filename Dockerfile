@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+ENV SOLO_STUDIO_REQUIRE_API_TOKEN=1
+
 # Python dependencies
 RUN pip install --no-cache-dir \
     fastapi \

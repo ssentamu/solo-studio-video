@@ -509,6 +509,25 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("safeClassToken", html)
         self.assertIn("addEventListener('click'", html)
 
+    def test_frontend_sends_operator_token_for_protected_job_routes(self):
+        html = (ROOT / "frontend" / "index.html").read_text()
+
+        self.assertIn("id=\"api-token\"", html)
+        self.assertIn("API_TOKEN_STORAGE_KEY", html)
+        self.assertIn("function protectedFetch", html)
+        self.assertIn("headers.set('Authorization', 'Bearer ' + token)", html)
+        self.assertIn("sessionStorage.setItem", html)
+        self.assertIn("sessionStorage.getItem", html)
+        self.assertNotIn("localStorage", html)
+        self.assertIn("protectedFetch('/jobs'", html)
+        self.assertIn("protectedFetch('/jobs/' + currentJobId)", html)
+        self.assertIn("protectedFetch('/jobs?limit=10')", html)
+        self.assertIn("protectedFetch('/jobs/from-template/'", html)
+        self.assertIn("protectedFetch('/jobs/' + encodeURIComponent(jobId) + '/download')", html)
+        self.assertIn("filenameFromDisposition", html)
+        self.assertIn("res.headers.get('Content-Disposition')", html)
+        self.assertNotIn("id=\"download-link\"", html)
+
 
 class ApiPackageStatusTests(unittest.TestCase):
     def test_health_endpoint_is_available_for_deploy_smoke(self):
@@ -533,6 +552,54 @@ class ApiPackageStatusTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["service"], "solo-studio-video")
+
+    def test_token_gates_job_routes_but_leaves_health_and_templates_public(self):
+        from fastapi.testclient import TestClient
+        import api
+
+        old_token = api.API_TOKEN
+        old_jobs_file = api.JOBS_FILE
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                test_token = "test-" + "secret"
+                api.API_TOKEN = test_token
+                api.JOBS_FILE = Path(tmp) / "jobs.json"
+                update_json_file(api.JOBS_FILE, lambda _jobs: {})
+                client = TestClient(api.app)
+
+                self.assertEqual(client.get("/api/health").status_code, 200)
+                self.assertEqual(client.get("/api/templates").status_code, 200)
+                self.assertEqual(client.get("/api/jobs").status_code, 401)
+                self.assertEqual(client.get("/video/api/jobs").status_code, 401)
+                self.assertEqual(
+                    client.get("/api/jobs", headers={"Authorization": "Bearer wrong"}).status_code,
+                    401,
+                )
+                self.assertEqual(
+                    client.get("/api/jobs", headers={"Authorization": f"Bearer {test_token}"}).status_code,
+                    200,
+                )
+                self.assertEqual(
+                    client.get("/video/api/jobs", headers={"X-Solo-Studio-Token": test_token}).status_code,
+                    200,
+                )
+                self.assertEqual(client.get("/api/jobs/missing").status_code, 401)
+                self.assertEqual(
+                    client.get("/api/jobs/missing", headers={"Authorization": f"Bearer {test_token}"}).status_code,
+                    404,
+                )
+            finally:
+                api.API_TOKEN = old_token
+                api.JOBS_FILE = old_jobs_file
+
+    def test_api_cors_is_not_wildcard_by_default(self):
+        source = (ROOT / "api.py").read_text()
+
+        self.assertIn("SOLO_STUDIO_CORS_ORIGINS", source)
+        self.assertIn("SOLO_STUDIO_REQUIRE_API_TOKEN", source)
+        self.assertIn("RuntimeError", source)
+        self.assertIn("allow_origins=ALLOWED_ORIGINS", source)
+        self.assertNotIn("allow_origins=[\"*\"]", source)
 
     def test_save_jobs_is_atomic_and_create_flow_does_not_overwrite_worker_updates(self):
         import api
@@ -689,12 +756,28 @@ class ApiPackageStatusTests(unittest.TestCase):
         dockerfile = (ROOT / "Dockerfile").read_text()
 
         self.assertIn("wait -n", dockerfile)
+        self.assertIn("ENV SOLO_STUDIO_REQUIRE_API_TOKEN=1", dockerfile)
         self.assertIn("nginx_pid=$!", dockerfile)
         self.assertIn("api_pid=$!", dockerfile)
         self.assertIn("worker_pid=$!", dockerfile)
         self.assertIn("kill \"$nginx_pid\" \"$api_pid\" \"$worker_pid\"", dockerfile)
         self.assertIn("HEALTHCHECK", dockerfile)
         self.assertIn("/api/health", dockerfile)
+
+    def test_deploy_script_requires_token_and_smokes_protected_jobs_route(self):
+        deploy = (ROOT / "deploy-traefik.sh").read_text()
+
+        self.assertIn("SOLO_STUDIO_API_TOKEN:?", deploy)
+        self.assertIn("-e SOLO_STUDIO_API_TOKEN", deploy)
+        self.assertIn("-e SOLO_STUDIO_REQUIRE_API_TOKEN=1", deploy)
+        self.assertIn("SOLO_STUDIO_CORS_ORIGINS", deploy)
+        self.assertIn("curl_config=$(mktemp)", deploy)
+        self.assertIn("chmod 600 \"$curl_config\"", deploy)
+        self.assertIn("printf 'header = \"Authorization: Bearer %s", deploy)
+        self.assertNotIn("Authorization: Bearer ***", deploy)
+        self.assertIn("curl -fsS --config \"$curl_config\"", deploy)
+        self.assertNotIn("curl -fsS -H \"Authorization: Bearer $SOLO_STUDIO_API_TOKEN\"", deploy)
+        self.assertIn("https://edgescout.tech/video/api/jobs?limit=1", deploy)
 
 
 if __name__ == "__main__":

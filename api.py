@@ -6,13 +6,13 @@ GET    /api/jobs/{id}     Get job status + progress
 GET    /api/jobs/{id}/download  Download final package (zip)
 GET    /api/jobs          List recent jobs
 """
-import json, uuid, shutil, zipfile, io, time
+import json, uuid, shutil, zipfile, io, time, os, secrets
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
 
 import yaml
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import Depends, FastAPI, Header, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,12 +27,24 @@ APP_DIR = Path(__file__).resolve().parent
 OUTPUT_ROOT = APP_DIR / "output"
 JOBS_FILE = APP_DIR / "jobs.json"
 FRONTEND_DIR = APP_DIR / "frontend"
+API_TOKEN = os.getenv("SOLO_STUDIO_API_TOKEN", "").strip()
+REQUIRE_API_TOKEN = os.getenv("SOLO_STUDIO_REQUIRE_API_TOKEN", "").strip().lower() in {"1", "true", "yes"}
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("SOLO_STUDIO_CORS_ORIGINS", "https://edgescout.tech").split(",")
+    if origin.strip()
+]
+
+if REQUIRE_API_TOKEN and not API_TOKEN:
+    raise RuntimeError("SOLO_STUDIO_API_TOKEN is required when SOLO_STUDIO_REQUIRE_API_TOKEN=1")
+# Local development can run with token auth disabled. Docker/prod enables
+# SOLO_STUDIO_REQUIRE_API_TOKEN=1 so accidental tokenless deployments fail closed.
 
 app = FastAPI(title="Solo Studio API", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -82,6 +94,28 @@ class JobStatus(BaseModel):
     has_clips: bool = False
     has_final_video: bool = False
     package_status: str = "not_started"
+
+
+def require_api_token(
+    authorization: str | None = Header(default=None),
+    x_solo_studio_token: str | None = Header(default=None),
+) -> None:
+    """Protect job state/mutation routes when SOLO_STUDIO_API_TOKEN is set."""
+    if not API_TOKEN:
+        return
+
+    supplied = x_solo_studio_token or ""
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and value:
+            supplied = value.strip()
+
+    if not supplied or not secrets.compare_digest(supplied, API_TOKEN):
+        raise HTTPException(
+            status_code=401,
+            detail="Solo Studio API token required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 # ── Job store (JSON file persistence; API/worker writes use locked updates) ──
@@ -164,7 +198,7 @@ async def index():
     return FileResponse(FRONTEND_DIR / "index.html")
 
 
-@app.get("/api/jobs")
+@app.get("/api/jobs", dependencies=[Depends(require_api_token)])
 async def list_jobs(limit: int = 10):
     """List recent jobs, newest first."""
     all_jobs = _load_jobs_for_api()
@@ -172,7 +206,7 @@ async def list_jobs(limit: int = 10):
     return await run_in_threadpool(_enrich_jobs, sorted_jobs[:limit])
 
 
-@app.post("/api/jobs", status_code=201)
+@app.post("/api/jobs", status_code=201, dependencies=[Depends(require_api_token)])
 async def create_job(brief: BriefRequest):
     """Create a new video generation job."""
     job_id = uuid.uuid4().hex[:12]
@@ -229,7 +263,7 @@ async def list_templates():
         return json.load(f)
 
 
-@app.post("/api/jobs/from-template/{template_id}", status_code=201)
+@app.post("/api/jobs/from-template/{template_id}", status_code=201, dependencies=[Depends(require_api_token)])
 async def create_job_from_template(template_id: str):
     """Create a job from a pre-built template."""
     templates_path = Path(__file__).parent / "templates.json"
@@ -284,7 +318,7 @@ async def create_job_from_template(template_id: str):
     return JSONResponse(content=enriched, status_code=201)
 
 
-@app.get("/api/jobs/{job_id}")
+@app.get("/api/jobs/{job_id}", dependencies=[Depends(require_api_token)])
 async def get_job_status(job_id: str):
     """Get job status and progress."""
     all_jobs = _load_jobs_for_api()
@@ -293,7 +327,7 @@ async def get_job_status(job_id: str):
     return await run_in_threadpool(_enrich_job, all_jobs[job_id])
 
 
-@app.get("/api/jobs/{job_id}/download")
+@app.get("/api/jobs/{job_id}/download", dependencies=[Depends(require_api_token)])
 async def download_job(job_id: str):
     """Download the complete job output as a zip file."""
     all_jobs = _load_jobs_for_api()
