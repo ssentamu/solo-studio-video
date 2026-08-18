@@ -11,6 +11,7 @@ output/*/
 # Jobs state
 jobs.json
 jobs.json.lock
+.solo_studio_api_token
 
 # IDE
 .idea/
