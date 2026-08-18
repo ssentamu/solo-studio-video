@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir \
 # Copy app code
 COPY api.py /app/
 COPY worker.py /app/
+COPY package_utils.py /app/
 COPY engines/ /app/engines/
 COPY pipeline.py /app/
 COPY frontend/ /app/frontend/
@@ -38,8 +39,24 @@ RUN rm -f /etc/nginx/sites-enabled/default && \
         } \
     }' > /etc/nginx/conf.d/default.conf
 
-# Start script
-RUN printf '#!/bin/bash\nset -e\nnginx\ncd /app\npython api.py &\nsleep 2\npython worker.py &\nwait\n' > /app/start.sh && chmod +x /app/start.sh
+# Start script — fail the container if any critical process exits.
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'set -euo pipefail' \
+    'nginx -g "daemon off;" &' \
+    'nginx_pid=$!' \
+    'cd /app' \
+    'python api.py &' \
+    'api_pid=$!' \
+    'python worker.py &' \
+    'worker_pid=$!' \
+    'wait -n "$nginx_pid" "$api_pid" "$worker_pid"' \
+    'status=$?' \
+    'kill "$nginx_pid" "$api_pid" "$worker_pid" 2>/dev/null || true' \
+    'wait "$nginx_pid" "$api_pid" "$worker_pid" 2>/dev/null || true' \
+    'exit "$status"' \
+    > /app/start.sh && chmod +x /app/start.sh
 
 EXPOSE 9091
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl -fsS http://127.0.0.1:9091/api/health >/dev/null || exit 1
 CMD ["/app/start.sh"]

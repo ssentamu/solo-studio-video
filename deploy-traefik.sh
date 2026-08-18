@@ -51,7 +51,8 @@ docker ps --filter name=solo-studio-video --format "table {{.Names}}\t{{.Status}
 
 echo ""
 echo "=== Smoke test ==="
-curl -sI https://edgescout.tech/video/ 2>&1 | head -5
+curl -sSI https://edgescout.tech/video/ 2>&1 | head -5
+curl -fsS https://edgescout.tech/video/api/health 2>&1
 
 echo ""
 echo "=== URL ==="

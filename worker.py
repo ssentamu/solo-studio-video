@@ -6,7 +6,9 @@ Uses a simple polling loop (no Redis dependency — standalone).
 """
 import json, subprocess, sys, time, shutil
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+
+from package_utils import clear_generated_artifacts, read_json_object, update_json_file, write_package_manifest
 
 APP_DIR = Path(__file__).resolve().parent
 OUTPUT_ROOT = APP_DIR / "output"
@@ -18,29 +20,17 @@ POLL_INTERVAL = 2  # seconds
 
 
 def load_jobs() -> dict:
-    if JOBS_FILE.exists():
-        try:
-            with open(JOBS_FILE) as f:
-                content = f.read().strip()
-                if content:
-                    return json.loads(content)
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return {}
-
-
-def save_jobs(jobs: dict):
-    JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(JOBS_FILE, 'w') as f:
-        json.dump(jobs, f, indent=2)
+    return read_json_object(JOBS_FILE)
 
 
 def update_job(job_id: str, **kwargs):
     """Update a job's fields and persist."""
-    jobs = load_jobs()
-    if job_id in jobs:
-        jobs[job_id].update(kwargs)
-        save_jobs(jobs)
+    def apply_update(jobs: dict) -> dict:
+        if job_id in jobs:
+            jobs[job_id].update(kwargs)
+        return jobs
+
+    update_json_file(JOBS_FILE, apply_update)
 
 
 def run_stage(job_id: str, name: str, script: str, *args) -> bool:
@@ -48,7 +38,14 @@ def run_stage(job_id: str, name: str, script: str, *args) -> bool:
     cmd = [sys.executable, str(ENGINES_DIR / script), *args]
     print(f"  [{job_id}] Running: {name}")
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        print(f"  [{job_id}] FAILED: {name} timed out")
+        return False
+    except OSError as exc:
+        print(f"  [{job_id}] FAILED: {name} could not start: {exc}")
+        return False
     if result.returncode != 0:
         print(f"  [{job_id}] FAILED: {name}")
         print(f"  stderr: {result.stderr[:500]}")
@@ -60,25 +57,14 @@ def process_job(job_id: str, job: dict):
     """Run the full pipeline for a single job."""
     out = OUTPUT_ROOT / job_id
 
-    # Progress map: each stage = ~14% (7 stages)
-    stages = [
-        ("research",      0.00, 0.12),
-        ("script",        0.12, 0.25),
-        ("visuals",       0.25, 0.38),
-        ("voiceover",     0.38, 0.50),
-        ("video_prompts", 0.50, 0.62),
-        ("music",         0.62, 0.72),
-        ("captions",      0.72, 0.82),
-        ("editor_export", 0.82, 0.92),
-        ("assembly",      0.92, 1.00),
-    ]
-
     try:
+        clear_generated_artifacts(out)
+
         # Stage 1: Research → Creative Brief
         update_job(job_id, status="running", stage="research", progress=0.05)
         brief_yaml = out / "brief.yaml"
         if not run_stage(job_id, "Research", "research_agent.py", str(brief_yaml), str(out)):
-            update_job(job_id, status="failed", error="Research agent failed")
+            _fail_job(job_id, out, job, "Research agent failed")
             return
 
         brief_json = out / "creative_brief.json"
@@ -86,7 +72,7 @@ def process_job(job_id: str, job: dict):
 
         # Stage 2: Script → Storyboard
         if not run_stage(job_id, "Script", "script_agent.py", str(brief_json), str(out)):
-            update_job(job_id, status="failed", error="Script agent failed")
+            _fail_job(job_id, out, job, "Script agent failed")
             return
 
         # Read storyboard to get scene/chapter counts
@@ -105,12 +91,12 @@ def process_job(job_id: str, job: dict):
 
         # Stage 3: Visuals — generate scene images
         if not run_stage(job_id, "Visuals", "design_agent.py", str(sb_path), str(out)):
-            print(f"  [{job_id}] Visuals agent failed — continuing")
+            _fail_job(job_id, out, job, "Visuals agent failed")
+            return
         else:
             # Try to generate images using the pipeline's image tools
             try:
-                _generate_visuals(out, sb)
-                update_job(job_id, has_visuals=True)
+                update_job(job_id, has_visuals=_generate_visuals(out, sb))
             except Exception as e:
                 print(f"  [{job_id}] Image generation not available: {e}")
 
@@ -118,8 +104,7 @@ def process_job(job_id: str, job: dict):
 
         # Stage 4: Voiceover — generate TTS audio
         try:
-            _generate_voiceover(out, sb)
-            update_job(job_id, has_voiceover=True)
+            update_job(job_id, has_voiceover=_generate_voiceover(out, sb))
         except Exception as e:
             print(f"  [{job_id}] Voiceover not available: {e}")
 
@@ -127,19 +112,38 @@ def process_job(job_id: str, job: dict):
 
         # Stage 5: Video Prompts
         if not run_stage(job_id, "Production", "production_agent.py", str(sb_path), str(out)):
-            print(f"  [{job_id}] Production agent failed — continuing")
+            _fail_job(job_id, out, job, "Production agent failed")
+            return
 
-        update_job(job_id, stage="captions", progress=0.70)
+        update_job(job_id, stage="video_generation", progress=0.64)
+
+        # Stage 5b: Video generation plan / safe dry-run.
+        vp_path = out / "video_prompts.json"
+        if vp_path.exists():
+            if not run_stage(job_id, "Video Generation Plan", "generation_agent.py", str(vp_path), str(out)):
+                _fail_job(job_id, out, job, "Generation plan failed")
+                return
+        else:
+            _fail_job(job_id, out, job, "Video prompts missing before generation stage")
+            return
+
+        update_job(job_id, stage="music", progress=0.72)
+        # Music is currently emitted as a prompt by the production agent; real
+        # audio generation is a later provider-integration stage.
+
+        update_job(job_id, stage="captions", progress=0.76)
 
         # Stage 6: Captions + Assembly
         if not run_stage(job_id, "Editing", "editing_agent.py", str(sb_path), str(out)):
-            print(f"  [{job_id}] Editing agent failed — continuing")
+            _fail_job(job_id, out, job, "Editing agent failed")
+            return
 
         update_job(job_id, stage="editor_export", progress=0.84)
 
         # Stage 7: Editor export (FCPXML)
         if not run_stage(job_id, "Editor Export", "editor_export.py", str(sb_path), str(out)):
-            print(f"  [{job_id}] Editor export failed — continuing")
+            _fail_job(job_id, out, job, "Editor export failed")
+            return
 
         # Generate thumbnail prompt always
         try:
@@ -149,27 +153,92 @@ def process_job(job_id: str, job: dict):
 
         update_job(job_id, stage="assembly", progress=0.92)
 
-        # Stage 7: Generate assembly manifest (already done by editing agent)
-        # Mark complete
+        completed_at = datetime.now(timezone.utc).isoformat()
+        manifest = write_package_manifest(
+            out,
+            _manifest_job_snapshot(
+                job_id,
+                job,
+                status="completed",
+                stage="done",
+                progress=1.0,
+                completed_at=completed_at,
+            ),
+        )
         update_job(
             job_id,
             status="completed",
             stage="done",
             progress=1.0,
-            completed_at=datetime.now(timezone.utc).isoformat(),
+            completed_at=completed_at,
+            package_status=manifest["package_status"],
+            has_visuals=manifest["has_visuals"],
+            has_voiceover=manifest["has_voiceover"],
+            has_clips=manifest["has_clips"],
+            has_final_video=manifest["has_final_video"],
+            verified_clips=manifest["verified_clips"],
         )
         print(f"  [{job_id}] COMPLETED — {sb.get('total_duration', 0):.0f}s, {len(sb.get('scenes', []))} scenes")
 
     except Exception as e:
         print(f"  [{job_id}] FAILED: {e}")
-        update_job(job_id, status="failed", error=str(e))
+        try:
+            _fail_job(job_id, out, job, str(e))
+        except Exception as finalizer_exc:
+            print(f"  [{job_id}] FAILED to finalize job failure: {finalizer_exc}")
+
+
+def _fail_job(job_id: str, out: Path, job: dict, error: str):
+    """Persist a failed terminal state plus an artifact-derived manifest."""
+    try:
+        manifest = write_package_manifest(
+            out,
+            _manifest_job_snapshot(job_id, job, status="failed", error=error),
+        )
+    except Exception as exc:
+        print(f"  [{job_id}] FAILED to write package manifest: {exc}")
+        manifest = {
+            "package_status": "failed",
+            "has_visuals": False,
+            "has_voiceover": False,
+            "has_clips": False,
+            "has_final_video": False,
+            "verified_clips": 0,
+        }
+    try:
+        update_job(
+            job_id,
+            status="failed",
+            error=error,
+            package_status=manifest["package_status"],
+            has_visuals=manifest["has_visuals"],
+            has_voiceover=manifest["has_voiceover"],
+            has_clips=manifest["has_clips"],
+            has_final_video=manifest["has_final_video"],
+            verified_clips=manifest["verified_clips"],
+        )
+    except Exception as exc:
+        print(f"  [{job_id}] FAILED to persist job failure state: {exc}")
+
+
+def _manifest_job_snapshot(job_id: str, fallback: dict, **overrides) -> dict:
+    """Build a manifest job snapshot from latest persisted state when available."""
+    snapshot = dict(fallback)
+    try:
+        latest = load_jobs().get(job_id)
+        if isinstance(latest, dict):
+            snapshot.update(latest)
+    except Exception as exc:
+        print(f"  [{job_id}] Could not load latest job snapshot for manifest: {exc}")
+    snapshot.update(overrides)
+    return snapshot
 
 
 def _generate_visuals(out: Path, storyboard: dict):
     """Generate scene images using the host's image generation tools."""
     prompts_path = out / "visual_prompts.json"
     if not prompts_path.exists():
-        return
+        return False
 
     with open(prompts_path) as f:
         manifest = json.load(f)
@@ -188,19 +257,30 @@ def _generate_visuals(out: Path, storyboard: dict):
             'pending': len(prompts),
             'note': 'Images not generated in worker process. Use API directly.'
         }, f, indent=2)
+    for path in visuals_dir.glob("scene_*.png"):
+        if not path.is_file() or path.stat().st_size <= 8:
+            continue
+        try:
+            if path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n":
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _generate_voiceover(out: Path, storyboard: dict):
     """Generate voiceover audio."""
     vo_script = out / "audio" / "voiceover_script.txt"
     if not vo_script.exists():
-        return
+        return False
 
     with open(vo_script) as f:
         text = f.read()
 
     print(f"  [{out.name}] Would generate voiceover ({len(text)} chars — needs TTS API key)")
     # TTS requires API key — produce the script and note it needs rendering
+    audio = out / "audio" / "voiceover.mp3"
+    return audio.is_file() and audio.stat().st_size > 0
 
 
 def _generate_thumbnail_for_job(out: Path, brief_json: Path):
@@ -236,7 +316,12 @@ def main():
     print(f"  Jobs file: {JOBS_FILE}")
 
     while True:
-        jobs = load_jobs()
+        try:
+            jobs = load_jobs()
+        except (ValueError, OSError) as exc:
+            print(f"Jobs store invalid; refusing to process queued jobs until repaired: {exc}")
+            time.sleep(POLL_INTERVAL)
+            continue
         queued = [j for j in jobs.values() if j.get('status') == 'queued']
 
         for job in queued:
@@ -246,7 +331,10 @@ def main():
             print(f"  Topic: {job['topic'][:80]}")
             print(f"  Duration: {job.get('duration_seconds', 0)}s")
             print(f"{'='*50}")
-            process_job(job_id, job)
+            try:
+                process_job(job_id, job)
+            except Exception as exc:
+                print(f"  [{job_id}] Unhandled job processing error; worker will continue: {exc}")
 
         time.sleep(POLL_INTERVAL)
 

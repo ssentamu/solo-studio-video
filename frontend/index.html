@@ -213,6 +213,15 @@
     color: var(--ink-2);
   }
   .pill.ok { color: var(--green); }
+  .status-note {
+    margin-top: 12px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: var(--surface-2);
+    color: var(--ink-2);
+    font-size: 13px;
+    line-height: 1.45;
+  }
 
   /* ── Stage Pipeline ── */
   .pipeline {
@@ -444,13 +453,19 @@
         <span id="stage-text">Waiting to start...</span>
         <span style="margin-left: auto; color: var(--ink-3);" id="progress-pct">0%</span>
       </div>
+      <div class="status-note" id="package-status-note">Package status: not_started</div>
 
       <!-- Pipeline steps -->
       <div class="pipeline" id="pipeline-steps">
-        <div class="pipeline-step"></div><div class="pipeline-step"></div>
-        <div class="pipeline-step"></div><div class="pipeline-step"></div>
-        <div class="pipeline-step"></div><div class="pipeline-step"></div>
-        <div class="pipeline-step"></div><div class="pipeline-step"></div>
+        <div class="pipeline-step"></div>
+        <div class="pipeline-step"></div>
+        <div class="pipeline-step"></div>
+        <div class="pipeline-step"></div>
+        <div class="pipeline-step"></div>
+        <div class="pipeline-step"></div>
+        <div class="pipeline-step"></div>
+        <div class="pipeline-step"></div>
+        <div class="pipeline-step"></div>
         <div class="pipeline-step"></div>
       </div>
 
@@ -483,8 +498,9 @@
       <div class="check">✓</div>
       <h2>Package Ready</h2>
       <p style="color: var(--ink-2); margin: 12px 0 20px; font-size: 14px;">
-        Your video production package has been generated. Download includes:
+        Download the current package. Available artifacts are marked below.
       </p>
+      <div class="status-note" id="download-status-note"></div>
 
       <div class="pills" id="artifact-pills"></div>
 
@@ -599,8 +615,8 @@ function updateJobView(job) {
 
   // Badge
   const badge = document.getElementById('job-badge');
-  badge.textContent = job.status;
-  badge.className = 'badge badge-' + job.status;
+  badge.textContent = String(job.status ?? 'unknown');
+  badge.className = 'badge badge-' + safeClassToken(job.status);
 
   // Spinner
   const spin = document.getElementById('stage-spinner');
@@ -610,11 +626,16 @@ function updateJobView(job) {
   document.getElementById('stat-format').textContent = job.format || '—';
   document.getElementById('stat-chapters').textContent = job.chapters || '—';
   document.getElementById('stat-scenes').textContent = job.scenes || '—';
+  document.getElementById('package-status-note').textContent = packageStatusNote(job.package_status || 'not_started');
 
   // Pipeline steps
-  const stages = ['research', 'script', 'visuals', 'voiceover', 'video_prompts', 'music', 'captions', 'editor_export', 'assembly'];
+  const stages = ['research', 'script', 'visuals', 'voiceover', 'video_prompts', 'video_generation', 'music', 'captions', 'editor_export', 'assembly'];
   const currentIdx = stages.indexOf(job.stage);
-  const steps = document.getElementById('pipeline-steps').children;
+  const pipeline = document.getElementById('pipeline-steps');
+  if (pipeline.children.length !== stages.length) {
+    pipeline.innerHTML = stages.map(() => '<div class="pipeline-step"></div>').join('');
+  }
+  const steps = pipeline.children;
   for (let i = 0; i < steps.length; i++) {
     steps[i].className = 'pipeline-step';
     if (job.status === 'completed') {
@@ -649,6 +670,7 @@ function formatStage(stage) {
     visuals: 'Generating scene visuals...',
     voiceover: 'Creating voiceover track...',
     video_prompts: 'Preparing video generation prompts...',
+    video_generation: 'Preparing clip generation plan...',
     music: 'Composing background music...',
     captions: 'Generating captions...',
     editor_export: 'Exporting editor project file...',
@@ -661,18 +683,27 @@ function formatStage(stage) {
 function showDownloadView(job) {
   showView('download');
 
+  const packageStatus = job.package_status || 'not_started';
+  document.getElementById('download-status-note').textContent = packageStatusNote(packageStatus);
+
   // Artifact pills
   const pills = document.getElementById('artifact-pills');
+  const artifacts = job.artifact_summary || {};
   const items = [
-    { label: 'Creative Brief', ok: true },
-    { label: 'Full Script', ok: true },
-    { label: 'Storyboard', ok: true },
+    { label: 'Creative Brief', ok: artifacts.creative_brief },
+    { label: 'Full Script', ok: artifacts.script },
+    { label: 'Storyboard', ok: artifacts.storyboard },
     { label: 'Scene Images', ok: job.has_visuals },
-    { label: 'Voiceover', ok: job.has_voiceover },
-    { label: 'Video Prompts', ok: true },
-    { label: 'Music Prompt', ok: true },
-    { label: 'Captions (.srt)', ok: true },
-    { label: 'Assembly Manifest', ok: true },
+    { label: 'Voiceover', ok: job.has_voiceover || artifacts.voiceover_audio },
+    { label: 'Voiceover Script', ok: artifacts.voiceover_script },
+    { label: 'Video Prompts', ok: artifacts.video_prompts },
+    { label: 'Generation Plan', ok: artifacts.generation_plan },
+    { label: 'Generated Clips', ok: job.has_clips },
+    { label: 'Final MP4', ok: job.has_final_video },
+    { label: 'Music Prompt', ok: artifacts.music_prompt },
+    { label: 'Captions (.srt)', ok: artifacts.captions },
+    { label: 'Assembly Manifest', ok: artifacts.assembly_manifest },
+    { label: 'Timeline (FCPXML)', ok: artifacts.timeline_fcpxml },
   ];
   pills.innerHTML = items.map(i =>
     `<span class="pill${i.ok ? ' ok' : ''}">${i.ok ? '✓' : '○'} ${i.label}</span>`
@@ -710,14 +741,17 @@ async function loadRecentJobs() {
     }
 
     list.innerHTML = jobs.map(j => `
-      <div class="job-item" onclick="viewJob('${j.id}')">
+      <div class="job-item" data-job-id="${escapeHtml(j.id)}">
         <div style="flex: 1; min-width: 0;">
           <div class="job-topic">${escapeHtml(j.topic)}</div>
-          <div class="job-meta">${Math.round(j.duration_seconds / 60)}m · ${j.scenes || 0} scenes · ${j.format || 'pending'}</div>
+          <div class="job-meta">${Math.round(j.duration_seconds / 60)}m · ${j.scenes || 0} scenes · ${escapeHtml(j.format || 'pending')} · ${escapeHtml(j.package_status || 'not_started')}</div>
         </div>
-        <span class="badge badge-${j.status}">${j.status}</span>
+        <span class="badge badge-${safeClassToken(j.status)}">${escapeHtml(j.status)}</span>
       </div>
     `).join('');
+    list.querySelectorAll('.job-item[data-job-id]').forEach(item => {
+      item.addEventListener('click', () => viewJob(item.dataset.jobId));
+    });
   } catch (err) {
     console.error('Failed to load recent jobs:', err);
   }
@@ -750,13 +784,29 @@ async function loadJobStatus(jobId) {
 
 function escapeHtml(text) {
   const div = document.createElement('div');
-  div.textContent = text;
+  div.textContent = String(text ?? '');
   return div.innerHTML;
 }
 
+function safeClassToken(text) {
+  return String(text ?? '').toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+}
+
+function packageStatusNote(status) {
+  const notes = {
+    not_started: 'Package status: not_started — no generated artifacts yet.',
+    research_only: 'Package status: research_only — creative brief exists, but script/video package is incomplete.',
+    script_package: 'Package status: script_package — script and storyboard exist, but video/editor artifacts are incomplete.',
+    prompt_package_only: 'Package status: prompt_package_only — prompts exist, but editor timeline and verified clips/final MP4 do not.',
+    editor_package: 'Package status: editor_package — editor-ready package exists; real clips/final MP4 are not verified.',
+    clips_generated: 'Package status: clips_generated — scene MP4 clips are verified; final assembled video is not verified.',
+    final_video_ready: 'Package status: final_video_ready — final MP4 is verified.',
+    failed: 'Package status: failed — partial artifacts may still be present.',
+  };
+  return notes[status] || ('Package status: ' + status);
+}
+
 // ── Init ──
-// Immediate sync test: if this doesn't change the page, JS isn't running here
-document.getElementById('template-grid').innerHTML = '<p style="color: var(--green);">JS init section reached OK</p>';
 setTimeout(function() {
   loadRecentJobs();
   loadTemplates();
@@ -773,15 +823,12 @@ if (hash && hash.startsWith('#job-')) {
 // ── Templates ──
 async function loadTemplates() {
   const grid = document.getElementById('template-grid');
-  grid.innerHTML = '<p style="color: var(--yellow);">Loading templates (step 1: starting)...</p>';
+  grid.innerHTML = '<p style="color: var(--yellow); grid-column: 1/-1; text-align: center;">Loading templates...</p>';
   try {
     const url = API + '/templates';
-    grid.innerHTML = '<p style="color: var(--yellow);">Loading templates (step 2: fetching ' + url + ')...</p>';
     const res = await fetch(url);
-    grid.innerHTML = '<p style="color: var(--yellow);">Loading templates (step 3: status ' + res.status + ')...</p>';
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const text = await res.text();
-    grid.innerHTML = '<p style="color: var(--yellow);">Loading templates (step 4: parsed ' + text.length + ' bytes)...</p>';
     const templates = JSON.parse(text);
 
     if (!templates.length) {
@@ -790,20 +837,23 @@ async function loadTemplates() {
     }
 
     grid.innerHTML = templates.map(t => `
-      <div class="template-card" onclick="selectTemplate('${t.id}', this)" data-id="${t.id}">
-        <div class="template-category">${t.category}</div>
-        <div class="template-name">${t.name.replace(/'/g, "\\'")}</div>
-        <div class="template-desc">${t.description.replace(/'/g, "\\'")}</div>
+      <div class="template-card" data-id="${escapeHtml(t.id)}">
+        <div class="template-category">${escapeHtml(t.category)}</div>
+        <div class="template-name">${escapeHtml(t.name)}</div>
+        <div class="template-desc">${escapeHtml(t.description)}</div>
         <div class="template-meta">
-          <span>⏱ ${t.duration_minutes} min</span>
-          <span>🎬 ${t.platform}</span>
-          <span>🎯 ${t.tone}</span>
+          <span>⏱ ${escapeHtml(t.duration_minutes)} min</span>
+          <span>🎬 ${escapeHtml(t.platform)}</span>
+          <span>🎯 ${escapeHtml(t.tone)}</span>
         </div>
       </div>
     `).join('');
+    grid.querySelectorAll('.template-card[data-id]').forEach(card => {
+      card.addEventListener('click', () => selectTemplate(card.dataset.id, card));
+    });
   } catch (err) {
     console.error('Failed to load templates:', err);
-    grid.innerHTML = '<p style="color: var(--red); grid-column: 1/-1; text-align: center;">Templates unavailable: ' + err.message + '</p>';
+    grid.innerHTML = '<p style="color: var(--red); grid-column: 1/-1; text-align: center;">Templates unavailable. Check the API health endpoint and reload.</p>';
   }
 }
 
@@ -835,14 +885,14 @@ function selectTemplate(templateId, el) {
         btnRow = document.createElement('div');
         btnRow.id = 'quick-start-row';
         btnRow.style.cssText = 'margin-top: 8px;';
-        btnRow.innerHTML = `<button class="btn" onclick="quickStart('${templateId}'); return false;" style="width:100%">
+        btnRow.innerHTML = `<button class="btn" type="button" style="width:100%">
           ⚡ Generate from Template — "${escapeHtml(t.name)}"
         </button>`;
         document.getElementById('submit-btn').parentNode.appendChild(btnRow);
-      } else {
-        btnRow.querySelector('button').textContent = `⚡ Generate from Template — "${escapeHtml(t.name)}"`;
-        btnRow.querySelector('button').onclick = () => { quickStart(templateId); return false; };
       }
+      const quickStartButton = btnRow.querySelector('button');
+      quickStartButton.textContent = `⚡ Generate from Template — "${t.name}"`;
+      quickStartButton.onclick = () => { quickStart(templateId); return false; };
     });
 }
 
@@ -854,18 +904,17 @@ async function quickStart(templateId) {
   }
 
   try {
-    const res = await fetch(API + '/jobs/from-template/' + templateId, { method: 'POST' });
+    const res = await fetch(API + '/jobs/from-template/' + encodeURIComponent(templateId), { method: 'POST' });
     if (!res.ok) throw new Error('Failed to create job');
     const job = await res.json();
     currentJobId = job.id;
     showView('job');
     pollJob();
   } catch (err) {
-    alert('Error: ' + err.message);
-  } finally {
+    alert('Failed to start job: ' + err.message);
     if (btn) {
       btn.disabled = false;
-      btn.innerHTML = btn.textContent.replace('Creating...', 'Generate');
+      btn.textContent = 'Generate from Template';
     }
   }
 }

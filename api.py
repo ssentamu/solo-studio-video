@@ -11,11 +11,15 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
 
+import yaml
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
+
+from package_utils import compute_package_status, read_json_object, update_json_file, write_package_manifest
 
 
 # ── Config — auto-detect base dir (works in Docker and local) ──
@@ -32,6 +36,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def support_video_api_prefix(request, call_next):
+    """Allow direct container/local calls to /video/api/* as well as /api/*.
+
+    Production Traefik strips /video before forwarding. Direct app smoke tests
+    and local frontend sessions do not, so only API paths are normalized here;
+    static /video/* remains the reverse proxy's responsibility.
+    """
+    path = request.scope.get("path", "")
+    if path.startswith("/video/api/") or path == "/video/api":
+        request.scope["path"] = path[len("/video"):]
+    return await call_next(request)
 
 
 # ── Models ──
@@ -61,37 +79,85 @@ class JobStatus(BaseModel):
     error: Optional[str] = None
     has_visuals: bool = False
     has_voiceover: bool = False
+    has_clips: bool = False
+    has_final_video: bool = False
+    package_status: str = "not_started"
 
 
-# ── Job store (in-memory + JSON file for persistence) ──
+# ── Job store (JSON file persistence; API/worker writes use locked updates) ──
 def _load_jobs() -> dict:
-    if JOBS_FILE.exists():
-        try:
-            with open(JOBS_FILE) as f:
-                content = f.read().strip()
-                if content:
-                    return json.loads(content)
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return {}
+    return read_json_object(JOBS_FILE)
 
 
-def _save_jobs(jobs: dict):
-    JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(JOBS_FILE, 'w') as f:
-        json.dump(jobs, f, indent=2)
+def _load_jobs_for_api() -> dict:
+    try:
+        return _load_jobs()
+    except (ValueError, OSError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Jobs store is invalid and requires repair before job state can be read or changed.",
+        ) from exc
 
 
-jobs = _load_jobs()
+def _add_job_locked(job_id: str, job: dict) -> dict:
+    def add_job(all_jobs: dict) -> dict:
+        all_jobs[job_id] = job
+        return all_jobs
+
+    try:
+        return update_json_file(JOBS_FILE, add_job)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Jobs store is invalid and requires repair before new jobs can be created.",
+        ) from exc
 
 
-def get_job(job_id: str) -> dict:
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
+def _enrich_job(job: dict) -> dict:
+    """Attach artifact-derived package fields without mutating stored state."""
+    enriched = dict(job)
+    output_dir = OUTPUT_ROOT / job["id"]
+    if output_dir.exists():
+        summary = compute_package_status(output_dir, job.get("status"))
+        enriched.update({
+            "package_status": summary["package_status"],
+            "has_visuals": summary["has_visuals"],
+            "has_voiceover": summary["has_voiceover"],
+            "has_clips": summary["has_clips"],
+            "has_final_video": summary["has_final_video"],
+            "artifact_summary": summary["artifacts"],
+            "verified_clips": summary["verified_clips"],
+            "expected_scenes": summary["expected_scenes"],
+        })
+    else:
+        enriched.setdefault("package_status", "not_started")
+        enriched.setdefault("has_clips", False)
+        enriched.setdefault("has_final_video", False)
+    return enriched
+
+
+def _enrich_jobs(jobs_to_enrich: list[dict]) -> list[dict]:
+    """Enrich jobs in a worker thread so ffprobe never blocks the API event loop."""
+    return [_enrich_job(job) for job in jobs_to_enrich]
+
+
+def _write_download_manifest(job_dir: Path, job: dict) -> None:
+    """Refresh the package manifest in a worker thread before zipping."""
+    write_package_manifest(job_dir, _enrich_job(job))
 
 
 # ── Routes ──
+@app.get("/api/health")
+async def health():
+    """Health/readiness probe for Traefik/container smoke checks."""
+    return {
+        "ok": True,
+        "service": "solo-studio-video",
+        "version": app.version,
+        "time": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.get("/")
 async def index():
     """Serve the frontend."""
@@ -101,9 +167,9 @@ async def index():
 @app.get("/api/jobs")
 async def list_jobs(limit: int = 10):
     """List recent jobs, newest first."""
-    all_jobs = _load_jobs()
+    all_jobs = _load_jobs_for_api()
     sorted_jobs = sorted(all_jobs.values(), key=lambda j: j.get('created_at', ''), reverse=True)
-    return sorted_jobs[:limit]
+    return await run_in_threadpool(_enrich_jobs, sorted_jobs[:limit])
 
 
 @app.post("/api/jobs", status_code=201)
@@ -135,17 +201,20 @@ async def create_job(brief: BriefRequest):
         "error": None,
         "has_visuals": False,
         "has_voiceover": False,
+        "has_clips": False,
+        "has_final_video": False,
+        "package_status": "not_started",
     }
 
-    jobs[job_id] = job
-    _save_jobs(jobs)
+    _add_job_locked(job_id, job)
 
     # Write the brief YAML for the worker
     brief_path = OUTPUT_ROOT / job_id / "brief.yaml"
     brief_path.parent.mkdir(parents=True, exist_ok=True)
     _write_brief_yaml(brief_path, job)
 
-    return JSONResponse(content=job, status_code=201)
+    enriched = await run_in_threadpool(_enrich_job, job)
+    return JSONResponse(content=enriched, status_code=201)
 
 
 @app.get("/api/templates")
@@ -199,33 +268,35 @@ async def create_job_from_template(template_id: str):
         "error": None,
         "has_visuals": False,
         "has_voiceover": False,
+        "has_clips": False,
+        "has_final_video": False,
+        "package_status": "not_started",
     }
 
-    all_jobs = _load_jobs()
-    all_jobs[job_id] = job
-    _save_jobs(all_jobs)
+    _add_job_locked(job_id, job)
 
     # Write brief YAML for the worker
     brief_path = OUTPUT_ROOT / job_id / "brief.yaml"
     brief_path.parent.mkdir(parents=True, exist_ok=True)
     _write_brief_yaml(brief_path, job)
 
-    return JSONResponse(content=job, status_code=201)
+    enriched = await run_in_threadpool(_enrich_job, job)
+    return JSONResponse(content=enriched, status_code=201)
 
 
 @app.get("/api/jobs/{job_id}")
 async def get_job_status(job_id: str):
     """Get job status and progress."""
-    all_jobs = _load_jobs()
+    all_jobs = _load_jobs_for_api()
     if job_id not in all_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    return all_jobs[job_id]
+    return await run_in_threadpool(_enrich_job, all_jobs[job_id])
 
 
 @app.get("/api/jobs/{job_id}/download")
 async def download_job(job_id: str):
     """Download the complete job output as a zip file."""
-    all_jobs = _load_jobs()
+    all_jobs = _load_jobs_for_api()
     if job_id not in all_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     job = all_jobs[job_id]
@@ -235,6 +306,8 @@ async def download_job(job_id: str):
     job_dir = OUTPUT_ROOT / job_id
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="Job output not found")
+
+    await run_in_threadpool(_write_download_manifest, job_dir, job)
 
     # Create zip in memory
     buf = io.BytesIO()
@@ -258,21 +331,18 @@ async def download_job(job_id: str):
 # ── Helpers ──
 def _write_brief_yaml(path: Path, job: dict):
     """Write a brief YAML file for the pipeline worker."""
-    lines = [
-        f"topic: \"{job['topic']}\"",
-        f"target_audience: \"{job['target_audience']}\"",
-        f"duration_seconds: {job['duration_seconds']}",
-        f"platform: \"{job['platform']}\"",
-        f"tone: \"{job['tone']}\"",
-        f"key_messages:",
-    ]
-    for msg in job.get('key_messages', []):
-        lines.append(f'  - "{msg}"')
-    lines.append(f'visual_style: "{job.get("visual_style", "")}"')
-    lines.append(f'call_to_action: "{job.get("call_to_action", "")}"')
-
+    payload = {
+        "topic": job["topic"],
+        "target_audience": job["target_audience"],
+        "duration_seconds": job["duration_seconds"],
+        "platform": job["platform"],
+        "tone": job["tone"],
+        "key_messages": job.get("key_messages", []),
+        "visual_style": job.get("visual_style", ""),
+        "call_to_action": job.get("call_to_action", ""),
+    }
     with open(path, 'w') as f:
-        f.write('\n'.join(lines) + '\n')
+        yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
 
 
 # Mount frontend static files — serve everything under /
