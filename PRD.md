@@ -887,12 +887,24 @@ Create zip downloads and package manifests so output is usable outside the app.
 
 ## 17. Risks
 
-1. **Misclassification risk:** The product can drift back into static-site generation. Guardrail: Solo Studio defaults to `/video`; `/studio` is explicitly a separate static-site detour.
-2. **False completion risk:** Prompt packages may be mistaken for final videos. Guardrail: artifact-derived statuses and file verification.
-3. **Provider auth risk:** Higgsfield/Seedance/TTS providers may need manual auth. Guardrail: safe dry-run and setup-needed messages.
-4. **Cost risk:** Video generation can become expensive. Guardrail: budget caps and preflight cost estimates.
-5. **Quality risk:** Generated clips may be inconsistent across scenes. Guardrail: locked references, character profiles, regenerate-scene workflow.
-6. **Source fidelity risk:** URL/source-derived claims may be hallucinated. Guardrail: source manifests and unsupported-claim flags.
+1. **Provider path maturity risk:** Real clip generation is available but remains **provider-dependent and opt-in** (`SOLO_STUDIO_ENABLE_HIGGSFIELD=1` + authenticated Higgsfield CLI). Without explicit enablement, output intentionally stays in prompt/editor-package mode (`editor_package` / `prompt_package_only`).
+   **Guardrail:** artifact-derived package states and explicit `setup_needed` reasons keep status truthful.
+
+2. **Auth/session risk:** token persistence in browser storage is no longer used. Operator auth now uses server-issued HttpOnly cookies and short-lived session auth, but this is still **single-operator, in-memory session state**.
+   **Guardrail:** keep production use constrained; avoid multi-tenant exposure until distributed session store + hardened tenancy controls are added.
+
+3. **Rollback risk:** previous deploy scripts lacked explicit rollback tagging. Deploy/recover flow in-repo now tags `release-*` and `rollback-*` images and runs bounded smoke checks.
+   **Guardrail:** operationally enforce use of the in-repo deploy script only; avoid ad-hoc replacement commands.
+
+4. **Misclassification risk:** The product can drift back into static-site generation. Guardrail: Solo Studio defaults to `/video`; `/studio` is explicitly a separate static-site detour.
+
+5. **False completion risk:** Prompt packages may be mistaken for final videos. Guardrail: artifact-derived statuses and file verification.
+
+6. **Cost risk:** Video generation can become expensive. Guardrail: budget caps and preflight cost estimates.
+
+7. **Quality risk:** Generated clips may be inconsistent across scenes. Guardrail: locked references, character profiles, regenerate-scene workflow.
+
+8. **Source fidelity risk:** URL/source-derived claims may be hallucinated. Guardrail: source manifests and unsupported-claim flags.
 
 ---
 

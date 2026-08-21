@@ -6,13 +6,25 @@ GET    /api/jobs/{id}     Get job status + progress
 GET    /api/jobs/{id}/download  Download final package (zip)
 GET    /api/jobs          List recent jobs
 """
-import json, uuid, shutil, zipfile, io, time, os, secrets
+import ipaddress
+import io
+import json
+import math
+import os
+import secrets
+import shutil
+import time
+import uuid
+import zipfile
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 import yaml
-from fastapi import Depends, FastAPI, Header, HTTPException, BackgroundTasks
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, BackgroundTasks, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,10 +37,25 @@ from package_utils import compute_package_status, read_json_object, update_json_
 # ── Config — auto-detect base dir (works in Docker and local) ──
 APP_DIR = Path(__file__).resolve().parent
 OUTPUT_ROOT = APP_DIR / "output"
-JOBS_FILE = APP_DIR / "jobs.json"
+JOBS_FILE = Path(os.getenv("SOLO_STUDIO_JOBS_FILE", str(APP_DIR / "jobs.json")))
 FRONTEND_DIR = APP_DIR / "frontend"
 API_TOKEN = os.getenv("SOLO_STUDIO_API_TOKEN", "").strip()
 REQUIRE_API_TOKEN = os.getenv("SOLO_STUDIO_REQUIRE_API_TOKEN", "").strip().lower() in {"1", "true", "yes"}
+SESSION_COOKIE_NAME = "solo_studio_session"
+SESSION_COOKIE_PATH = os.getenv("SOLO_STUDIO_SESSION_COOKIE_PATH", "/")
+SESSION_MAX_AGE = int(os.getenv("SOLO_STUDIO_SESSION_MAX_AGE", "3600"))
+COOKIE_SECURE = os.getenv("SOLO_STUDIO_COOKIE_SECURE", "1" if (REQUIRE_API_TOKEN or API_TOKEN) else "0").strip().lower() not in {"0", "false", "no"}
+SESSION_TOKENS: dict[str, float] = {}
+SESSION_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+SESSION_LOGIN_WINDOW = int(os.getenv("SOLO_STUDIO_SESSION_LOGIN_WINDOW", "300"))
+SESSION_LOGIN_MAX_ATTEMPTS = int(os.getenv("SOLO_STUDIO_SESSION_LOGIN_MAX_ATTEMPTS", "10"))
+SESSION_LOGIN_MAX_KEYS = int(os.getenv("SOLO_STUDIO_SESSION_LOGIN_MAX_KEYS", "10000"))
+TRUST_PROXY_HEADERS = os.getenv("SOLO_STUDIO_TRUST_PROXY_HEADERS", "0").strip().lower() in {"1", "true", "yes"}
+TRUSTED_PROXY_NETWORKS = tuple(
+    ipaddress.ip_network(value.strip(), strict=False)
+    for value in os.getenv("SOLO_STUDIO_TRUSTED_PROXY_NETWORKS", "127.0.0.1/32,::1/128").split(",")
+    if value.strip()
+)
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv("SOLO_STUDIO_CORS_ORIGINS", "https://edgescout.tech").split(",")
@@ -50,6 +77,26 @@ app.add_middleware(
 )
 
 
+def _jsonable_no_nans(value):
+    """Recursively replace NaN/Infinity payloads that JSON can't serialize."""
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return str(value)
+        return value
+    if isinstance(value, list):
+        return [_jsonable_no_nans(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _jsonable_no_nans(item) for key, item in value.items()}
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _handle_request_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    del request
+    details = _jsonable_no_nans(jsonable_encoder(exc.errors()))
+    return JSONResponse(status_code=422, content={"detail": details})
+
+
 @app.middleware("http")
 async def support_video_api_prefix(request, call_next):
     """Allow direct container/local calls to /video/api/* as well as /api/*.
@@ -68,12 +115,16 @@ async def support_video_api_prefix(request, call_next):
 class BriefRequest(BaseModel):
     topic: str
     target_audience: str = "general"
-    duration_minutes: float = Field(default=1.0, ge=0.5, le=90)
+    duration_minutes: float = Field(default=1.0, ge=0.5, le=90, strict=True)
     platform: str = "youtube"
     tone: str = "professional"
     key_messages: list[str] = []
     visual_style: str = ""
     call_to_action: str = ""
+
+
+class OperatorSessionRequest(BaseModel):
+    token: str = ""
 
 
 class JobStatus(BaseModel):
@@ -96,26 +147,197 @@ class JobStatus(BaseModel):
     package_status: str = "not_started"
 
 
-def require_api_token(
-    authorization: str | None = Header(default=None),
-    x_solo_studio_token: str | None = Header(default=None),
-) -> None:
-    """Protect job state/mutation routes when SOLO_STUDIO_API_TOKEN is set."""
-    if not API_TOKEN:
-        return
-
+def _header_token(authorization: str | None, x_solo_studio_token: str | None) -> str:
     supplied = x_solo_studio_token or ""
     if authorization:
         scheme, _, value = authorization.partition(" ")
         if scheme.lower() == "bearer" and value:
             supplied = value.strip()
+    return supplied
 
-    if not supplied or not secrets.compare_digest(supplied, API_TOKEN):
+
+def _prune_sessions() -> None:
+    now = time.time()
+    for session, expires_at in list(SESSION_TOKENS.items()):
+        if expires_at <= now:
+            SESSION_TOKENS.pop(session, None)
+
+
+def _login_client_keys(request: Request) -> tuple[str, ...]:
+    peer = request.client.host if request.client else "unknown"
+    try:
+        address = ipaddress.ip_address(peer)
+        trusted_peer = any(address in network for network in TRUSTED_PROXY_NETWORKS)
+    except ValueError:
+        trusted_peer = peer == "testclient"
+    if TRUST_PROXY_HEADERS and trusted_peer:
+        forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+        forwarded = forwarded or request.headers.get("x-real-ip", "").strip()
+        try:
+            forwarded = str(ipaddress.ip_address(forwarded)) if forwarded else ""
+        except ValueError:
+            forwarded = ""
+        return (f"forwarded:{forwarded[:128]}",) if forwarded and forwarded != peer else (f"peer:{peer[:128]}",)
+    return (f"peer:{peer[:128]}",)
+
+
+def _duration_minutes_to_seconds(duration_minutes: float | int | str) -> int:
+    if isinstance(duration_minutes, bool):
+        raise ValueError("duration_minutes must be a real number")
+
+    try:
+        minutes = float(duration_minutes)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError("duration_minutes must be a number")
+
+    if not math.isfinite(minutes):
+        raise ValueError("duration_minutes must be finite")
+
+    if minutes < 0.5 or minutes > 90:
+        raise ValueError("duration_minutes must be between 0.5 and 90")
+
+    return int(minutes * 60)
+
+
+def _allow_session_login(request: Request) -> bool:
+    now = time.time()
+    keys = _login_client_keys(request)
+    for candidate, timestamps in list(SESSION_LOGIN_ATTEMPTS.items()):
+        recent = [timestamp for timestamp in timestamps if timestamp > now - SESSION_LOGIN_WINDOW]
+        if recent:
+            SESSION_LOGIN_ATTEMPTS[candidate] = recent
+        else:
+            SESSION_LOGIN_ATTEMPTS.pop(candidate, None)
+    if any(
+        len(SESSION_LOGIN_ATTEMPTS.get(key, [])) >= SESSION_LOGIN_MAX_ATTEMPTS
+        for key in keys
+    ):
+        return False
+    max_stored_keys = max(SESSION_LOGIN_MAX_KEYS, 0)
+    while (
+        len(SESSION_LOGIN_ATTEMPTS) + len([key for key in keys if key not in SESSION_LOGIN_ATTEMPTS])
+        > max_stored_keys
+    ):
+        if not SESSION_LOGIN_ATTEMPTS:
+            break
+        oldest_key = min(
+            SESSION_LOGIN_ATTEMPTS,
+            key=lambda candidate: SESSION_LOGIN_ATTEMPTS[candidate][-1],
+        )
+        SESSION_LOGIN_ATTEMPTS.pop(oldest_key, None)
+    for key in keys:
+        recent = [timestamp for timestamp in SESSION_LOGIN_ATTEMPTS.get(key, []) if timestamp > now - SESSION_LOGIN_WINDOW]
+        recent.append(now)
+        SESSION_LOGIN_ATTEMPTS[key] = recent
+    return True
+
+
+def _valid_header_token(authorization: str | None, x_solo_studio_token: str | None) -> bool:
+    supplied = _header_token(authorization, x_solo_studio_token)
+    return bool(supplied and API_TOKEN and secrets.compare_digest(supplied, API_TOKEN))
+
+
+def _csrf_origin_allowed(request: Request, *, require_header: bool = False) -> bool:
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return True
+    origin = request.headers.get("origin")
+    if origin:
+        return origin in ALLOWED_ORIGINS
+    referer = request.headers.get("referer")
+    if referer:
+        parsed = urlparse(referer)
+        return bool(parsed.scheme and parsed.netloc and f"{parsed.scheme}://{parsed.netloc}" in ALLOWED_ORIGINS)
+    return not require_header
+
+
+def require_api_token(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_solo_studio_token: str | None = Header(default=None),
+    solo_studio_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+) -> None:
+    """Protect job routes with a header token or short-lived HttpOnly session."""
+    if not API_TOKEN:
+        return
+    if not _csrf_origin_allowed(request, require_header=bool(solo_studio_session)):
+        raise HTTPException(status_code=403, detail="Cross-origin state-changing request refused.")
+
+    _prune_sessions()
+    if solo_studio_session and solo_studio_session in SESSION_TOKENS:
+        return
+    if not _valid_header_token(authorization, x_solo_studio_token):
+        if not _allow_session_login(request):
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed authentication attempts. Try again later.",
+                headers={"Retry-After": str(SESSION_LOGIN_WINDOW)},
+            )
         raise HTTPException(
             status_code=401,
             detail="Solo Studio API token required.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    for key in _login_client_keys(request):
+        SESSION_LOGIN_ATTEMPTS.pop(key, None)
+
+
+@app.post("/api/auth/session")
+async def create_session(
+    login: OperatorSessionRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_solo_studio_token: str | None = Header(default=None),
+):
+    """Exchange a manually entered operator token for an HttpOnly session cookie."""
+    if API_TOKEN and not _csrf_origin_allowed(request, require_header=True):
+        raise HTTPException(status_code=403, detail="Cross-origin authentication request refused.")
+    supplied = login.token.strip() or _header_token(authorization, x_solo_studio_token)
+    if API_TOKEN and not (supplied and secrets.compare_digest(supplied, API_TOKEN)):
+        if not _allow_session_login(request):
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed session attempts. Try again later.",
+                headers={"Retry-After": str(SESSION_LOGIN_WINDOW)},
+            )
+        raise HTTPException(
+            status_code=401,
+            detail="Solo Studio API token required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    response = Response(status_code=204)
+    if API_TOKEN:
+        for key in _login_client_keys(request):
+            SESSION_LOGIN_ATTEMPTS.pop(key, None)
+        _prune_sessions()
+        session = secrets.token_urlsafe(32)
+        SESSION_TOKENS[session] = time.time() + SESSION_MAX_AGE
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            session,
+            max_age=SESSION_MAX_AGE,
+            httponly=True,
+            secure=COOKIE_SECURE,
+            samesite="strict",
+            path=SESSION_COOKIE_PATH,
+        )
+    return response
+
+
+@app.post("/api/auth/logout")
+@app.delete("/api/auth/session")
+async def delete_session(
+    response: Response,
+    request: Request,
+    solo_studio_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+):
+    """Revoke the current in-memory session and clear the browser cookie."""
+    if API_TOKEN and not _csrf_origin_allowed(request, require_header=bool(solo_studio_session)):
+        raise HTTPException(status_code=403, detail="Cross-origin logout request refused.")
+    if solo_studio_session:
+        SESSION_TOKENS.pop(solo_studio_session, None)
+    response = Response(status_code=204)
+    response.delete_cookie(SESSION_COOKIE_NAME, path=SESSION_COOKIE_PATH)
+    return response
 
 
 # ── Job store (JSON file persistence; API/worker writes use locked updates) ──
@@ -212,7 +434,10 @@ async def create_job(brief: BriefRequest):
     job_id = uuid.uuid4().hex[:12]
 
     # Convert minutes to seconds
-    duration_seconds = int(brief.duration_minutes * 60)
+    try:
+        duration_seconds = _duration_minutes_to_seconds(brief.duration_minutes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
     job = {
         "id": job_id,
@@ -278,7 +503,10 @@ async def create_job_from_template(template_id: str):
         raise HTTPException(status_code=404, detail=f"Template '{template_id}' not found")
 
     job_id = uuid.uuid4().hex[:12]
-    duration_seconds = int(template['duration_minutes'] * 60)
+    try:
+        duration_seconds = _duration_minutes_to_seconds(template.get("duration_minutes", 1.0))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
     job = {
         "id": job_id,
@@ -386,4 +614,4 @@ app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="fronte
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)

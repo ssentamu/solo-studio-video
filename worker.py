@@ -4,7 +4,7 @@ Solo Studio Worker — Background pipeline executor.
 Watches jobs.json for queued jobs, runs the pipeline, updates status.
 Uses a simple polling loop (no Redis dependency — standalone).
 """
-import json, subprocess, sys, time, shutil
+import json, os, subprocess, sys, time, shutil
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -12,7 +12,7 @@ from package_utils import clear_generated_artifacts, read_json_object, update_js
 
 APP_DIR = Path(__file__).resolve().parent
 OUTPUT_ROOT = APP_DIR / "output"
-JOBS_FILE = APP_DIR / "jobs.json"
+JOBS_FILE = Path(os.getenv("SOLO_STUDIO_JOBS_FILE", str(APP_DIR / "jobs.json")))
 ENGINES_DIR = APP_DIR / "engines"
 PIPELINE = APP_DIR / "pipeline.py"
 
@@ -33,13 +33,18 @@ def update_job(job_id: str, **kwargs):
     update_json_file(JOBS_FILE, apply_update)
 
 
-def run_stage(job_id: str, name: str, script: str, *args) -> bool:
+def run_stage(job_id: str, name: str, script: str, *args, timeout: int | None = None) -> bool:
     """Run a pipeline stage and update job progress."""
     cmd = [sys.executable, str(ENGINES_DIR / script), *args]
     print(f"  [{job_id}] Running: {name}")
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout or int(os.getenv("SOLO_STUDIO_STAGE_TIMEOUT", "300")),
+        )
     except subprocess.TimeoutExpired:
         print(f"  [{job_id}] FAILED: {name} timed out")
         return False
@@ -120,7 +125,22 @@ def process_job(job_id: str, job: dict):
         # Stage 5b: Video generation plan / safe dry-run.
         vp_path = out / "video_prompts.json"
         if vp_path.exists():
-            if not run_stage(job_id, "Video Generation Plan", "generation_agent.py", str(vp_path), str(out)):
+            try:
+                scene_count = len(json.loads(vp_path.read_text()).get("scenes", []))
+            except (AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                scene_count = 1
+            provider_timeout_seconds = int(os.getenv("SOLO_STUDIO_HIGGSFIELD_TIMEOUT", "900"))
+            # Per scene: provider wait + bounded download + ffprobe verification,
+            # plus a stage-level margin for process startup and serialization.
+            provider_timeout = (provider_timeout_seconds + 120 + 30) * max(scene_count, 1) + 60
+            if not run_stage(
+                job_id,
+                "Video Generation Plan",
+                "generation_agent.py",
+                str(vp_path),
+                str(out),
+                timeout=provider_timeout,
+            ):
                 _fail_job(job_id, out, job, "Generation plan failed")
                 return
         else:

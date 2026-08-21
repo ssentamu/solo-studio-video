@@ -380,7 +380,7 @@
           <label>Operator API Token</label>
           <input type="password" id="api-token" autocomplete="off" placeholder="Required when production API auth is enabled">
           <p style="color: var(--ink-3); font-size: 12px; margin-top: 6px;">
-            Stored only for this browser session. Health/templates stay public; job creation, status, and downloads can be token-gated.
+            Submitted once, exchanged for a short-lived HttpOnly session cookie, then cleared from this page. Health/templates stay public; job creation, status, and downloads are token-gated.
           </p>
         </div>
         <div class="form-group">
@@ -529,32 +529,38 @@ console.log('Solo Studio JS loaded');
 // Hide JS warning banner — proves JS is executing
 document.getElementById('js-test').style.display = 'none';
 const API = '/video/api';
-const API_TOKEN_STORAGE_KEY = 'soloStudioApiToken';
 let currentJobId = null;
 let pollTimer = null;
 
 function getApiToken() {
   const input = document.getElementById('api-token');
-  return String((input && input.value) || sessionStorage.getItem(API_TOKEN_STORAGE_KEY) || '').trim();
+  return String((input && input.value) || '').trim();
 }
 
-function persistApiToken() {
+async function loginWithApiToken() {
   const token = getApiToken();
-  if (token) {
-    sessionStorage.setItem(API_TOKEN_STORAGE_KEY, token);
-  } else {
-    sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+  if (!token) return false;
+  try {
+    const response = await fetch(API + '/auth/session', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    return response.ok;
+  } finally {
+    document.getElementById('api-token').value = '';
   }
-  return token;
 }
 
-function protectedFetch(path, options = {}) {
+async function protectedFetch(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  const token = getApiToken();
-  if (token) {
-    headers.set('Authorization', 'Bearer ' + token);
+  const request = () => fetch(API + path, { ...options, credentials: 'same-origin', headers });
+  let response = await request();
+  if (response.status === 401 && await loginWithApiToken()) {
+    response = await request();
   }
-  return fetch(API + path, { ...options, headers });
+  return response;
 }
 
 async function requireOk(res, action) {
@@ -565,7 +571,7 @@ async function requireOk(res, action) {
     detail = body.detail ? ': ' + body.detail : '';
   } catch (_) {}
   if (res.status === 401) {
-    throw new Error('API token required. Enter the operator token and retry.');
+    throw new Error('Operator session required or expired. Enter the token and retry.');
   }
   throw new Error(action + ' failed with HTTP ' + res.status + detail);
 }
@@ -573,9 +579,6 @@ async function requireOk(res, action) {
 function initApiTokenControl() {
   const input = document.getElementById('api-token');
   if (!input) return;
-  input.value = sessionStorage.getItem(API_TOKEN_STORAGE_KEY) || '';
-  input.addEventListener('change', persistApiToken);
-  input.addEventListener('blur', persistApiToken);
 }
 
 // ── View switching ──
@@ -615,7 +618,6 @@ document.getElementById('brief-form').addEventListener('submit', async (e) => {
   };
 
   try {
-    persistApiToken();
     const res = await protectedFetch('/jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -971,7 +973,6 @@ async function quickStart(templateId) {
   }
 
   try {
-    persistApiToken();
     const res = await protectedFetch('/jobs/from-template/' + encodeURIComponent(templateId), { method: 'POST' });
     await requireOk(res, 'Create job from template');
     const job = await res.json();
@@ -995,7 +996,6 @@ document.getElementById('download-btn').addEventListener('click', async () => {
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Preparing download...';
   try {
-    persistApiToken();
     const res = await protectedFetch('/jobs/' + encodeURIComponent(jobId) + '/download');
     await requireOk(res, 'Download package');
     const blob = await res.blob();

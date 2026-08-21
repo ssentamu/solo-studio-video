@@ -7,10 +7,13 @@ actually exist in the job output directory.
 from __future__ import annotations
 
 import json
+import math
 import os
+import stat
 import re
 import shutil
 import subprocess
+import tempfile
 import fcntl
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,15 +84,33 @@ def atomic_write_json(path: str | Path, payload: Any) -> None:
     """Atomically write JSON to avoid torn reads of jobs/package metadata."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_text(json.dumps(payload, indent=2))
-        os.replace(tmp, path)
+        existing_mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        existing_mode = None
+    if path.name == "jobs.json":
+        existing_mode = 0o660
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+        if existing_mode is not None:
+            os.chmod(tmp_path, existing_mode)
+        os.replace(tmp_path, path)
     finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def read_json_object(path: str | Path) -> dict:
@@ -160,20 +181,41 @@ def update_json_file(path: str | Path, updater: Callable[[dict], dict | None]) -
 
 def _has_file(root: Path, relative: str) -> bool:
     path = root / relative
-    return path.is_file() and path.stat().st_size > 0
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def _probe_media(path: Path) -> dict[str, Any]:
     """Return conservative media-file verification details."""
     result: dict[str, Any] = {
         "path": str(path),
-        "exists": path.is_file(),
-        "size_bytes": path.stat().st_size if path.exists() else 0,
+        "exists": False,
+        "size_bytes": 0,
         "ffprobe_checked": False,
         "valid": False,
     }
+    try:
+        file_stat = path.stat()
+        result["exists"] = stat.S_ISREG(file_stat.st_mode)
+        result["size_bytes"] = file_stat.st_size if result["exists"] else 0
+    except OSError as exc:
+        result["error"] = f"media file is unavailable: {exc.__class__.__name__}"
+        return result
     if not result["exists"] or result["size_bytes"] <= 0:
         return result
+
+    is_mp4 = path.suffix.lower() == ".mp4"
+    if is_mp4:
+        try:
+            signature = path.read_bytes()[:12]
+        except OSError as exc:
+            result["error"] = f"could not read MP4 signature: {exc}"
+            return result
+        if len(signature) < 8 or signature[4:8] != b"ftyp":
+            result["error"] = "invalid MP4 signature"
+            return result
 
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
@@ -181,18 +223,23 @@ def _probe_media(path: Path) -> dict[str, Any]:
         return result
 
     result["ffprobe_checked"] = True
+    probe_command = [ffprobe, "-v", "error"]
+    if is_mp4:
+        probe_command += [
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_type:format=duration",
+            "-of", "json",
+        ]
+    else:
+        probe_command += [
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_type:format=duration",
+            "-of", "json",
+        ]
+    probe_command.append(str(path))
     try:
         proc = subprocess.run(
-            [
-                ffprobe,
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(path),
-            ],
+            probe_command,
             capture_output=True,
             text=True,
             timeout=15,
@@ -206,11 +253,40 @@ def _probe_media(path: Path) -> dict[str, Any]:
     if proc.returncode != 0:
         result["error"] = (proc.stderr or proc.stdout).strip()[:500]
         return result
-    try:
-        duration = float(proc.stdout.strip())
-    except ValueError:
-        result["error"] = f"invalid duration: {proc.stdout.strip()!r}"
-        return result
+    if is_mp4:
+        try:
+            payload = json.loads(proc.stdout)
+            if not isinstance(payload, dict):
+                raise ValueError("ffprobe payload must be an object")
+            streams = payload.get("streams", [])
+            media_format = payload.get("format")
+            if not isinstance(streams, list) or not isinstance(media_format, dict):
+                raise ValueError("ffprobe payload has invalid stream or format data")
+            duration = float(media_format.get("duration", "nan"))
+        except (AttributeError, ValueError, TypeError, json.JSONDecodeError):
+            result["error"] = "invalid MP4 ffprobe output"
+            return result
+        if not any(stream.get("codec_type") == "video" for stream in streams if isinstance(stream, dict)):
+            result["error"] = "MP4 has no video stream"
+            return result
+        if not math.isfinite(duration):
+            result["error"] = "MP4 duration is not finite"
+            return result
+    else:
+        try:
+            payload = json.loads(proc.stdout)
+            if not isinstance(payload, dict) or not isinstance(payload.get("streams"), list) or not isinstance(payload.get("format"), dict):
+                raise ValueError("invalid audio ffprobe output")
+            if not any(stream.get("codec_type") == "audio" for stream in payload["streams"] if isinstance(stream, dict)):
+                result["error"] = "audio artifact has no audio stream"
+                return result
+            duration = float(payload["format"].get("duration", "nan"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result["error"] = "invalid audio ffprobe output"
+            return result
+        if not math.isfinite(duration):
+            result["error"] = "media duration is not finite"
+            return result
     result["duration_seconds"] = duration
     result["valid"] = duration > 0
     return result
@@ -223,17 +299,31 @@ def _storyboard_info(root: Path) -> dict[str, Any]:
         return result
     try:
         data = json.loads(sb.read_text())
-    except json.JSONDecodeError as exc:
-        result["errors"].append(f"storyboard.json invalid JSON: {exc}")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        result["errors"].append(f"storyboard.json invalid or unreadable: {exc}")
         return result
     if not isinstance(data, dict):
         result["errors"].append(f"storyboard.json must be an object, got {type(data).__name__}")
         return result
-    scenes = data.get("scenes", [])
-    if not isinstance(scenes, list):
-        result["errors"].append(f"storyboard.json scenes must be a list, got {type(scenes).__name__}")
+    scenes = data.get("scenes")
+    if not isinstance(scenes, list) or not scenes:
+        result["errors"].append(
+            f"storyboard.json scenes must be a non-empty list, got {type(scenes).__name__}"
+        )
         return result
     result["expected_scenes"] = len(scenes)
+    if any(not isinstance(scene, dict) for scene in scenes):
+        result["errors"].append("storyboard.json every scene must be an object.")
+        return result
+    explicit_numbers = [scene.get("scene_number") for scene in scenes if "scene_number" in scene]
+    if explicit_numbers and (
+        len(explicit_numbers) != len(scenes)
+        or any(isinstance(number, bool) or not isinstance(number, int) or number <= 0 for number in explicit_numbers)
+        or len(set(explicit_numbers)) != len(explicit_numbers)
+        or set(explicit_numbers) != set(range(1, len(scenes) + 1))
+    ):
+        result["errors"].append("storyboard.json scene numbers must be contiguous, unique, and positive.")
+        return result
     result["valid"] = True
     return result
 
@@ -258,14 +348,33 @@ def _valid_clip_files(root: Path) -> list[dict[str, Any]]:
     return verified
 
 
+def _clip_file_coverage(root: Path) -> tuple[set[int], set[int], list[str]]:
+    """Inspect every scene clip filename, including invalid artifacts."""
+    clips_dir = root / "clips"
+    scene_numbers: list[int] = []
+    invalid_files: list[str] = []
+    if not clips_dir.is_dir():
+        return set(), set(), []
+    for path in sorted(clips_dir.iterdir()):
+        if not path.is_file():
+            continue
+        match = re.fullmatch(r"scene_(\d+)\.mp4", path.name)
+        if not match:
+            invalid_files.append(path.name)
+            continue
+        scene_numbers.append(int(match.group(1)))
+    duplicates = {number for number in scene_numbers if scene_numbers.count(number) > 1}
+    return set(scene_numbers), duplicates, invalid_files
+
+
 def _has_visual_files(root: Path) -> bool:
     visuals_dir = root / "visuals"
     if not visuals_dir.is_dir():
         return False
     for path in visuals_dir.glob("scene_*.png"):
-        if not path.is_file() or path.stat().st_size <= 8:
-            continue
         try:
+            if not path.is_file() or path.stat().st_size <= 8:
+                continue
             if path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n":
                 return True
         except OSError:
@@ -284,10 +393,18 @@ def compute_package_status(root: str | Path, job_status: str | None = None) -> d
     expected_scenes = int(storyboard["expected_scenes"])
     valid_clips = _valid_clip_files(root)
     clip_scene_numbers = {clip["scene_number"] for clip in valid_clips if isinstance(clip.get("scene_number"), int)}
+    all_clip_scene_numbers, duplicate_clip_scene_numbers, invalid_clip_files = _clip_file_coverage(root)
     expected_clip_numbers = set(range(1, expected_scenes + 1))
     missing_clip_numbers = sorted(expected_clip_numbers - clip_scene_numbers)
-    extra_clip_numbers = sorted(clip_scene_numbers - expected_clip_numbers)
-    complete_clip_coverage = bool(expected_scenes) and not missing_clip_numbers
+    extra_clip_numbers = sorted(all_clip_scene_numbers - expected_clip_numbers)
+    complete_clip_coverage = (
+        bool(expected_scenes)
+        and not missing_clip_numbers
+        and not extra_clip_numbers
+        and not duplicate_clip_scene_numbers
+        and not invalid_clip_files
+        and len(valid_clips) == expected_scenes
+    )
     final_video = _probe_media(root / "final" / "video.mp4")
 
     artifacts = {
@@ -344,6 +461,8 @@ def compute_package_status(root: str | Path, job_status: str | None = None) -> d
         "verified_clip_scene_numbers": sorted(clip_scene_numbers),
         "missing_clip_scene_numbers": missing_clip_numbers,
         "extra_clip_scene_numbers": extra_clip_numbers,
+        "duplicate_clip_scene_numbers": sorted(duplicate_clip_scene_numbers),
+        "invalid_clip_files": invalid_clip_files,
         "has_partial_clips": bool(valid_clips),
         "has_visuals": _has_visual_files(root),
         "has_voiceover": bool(artifacts["voiceover_audio"]),

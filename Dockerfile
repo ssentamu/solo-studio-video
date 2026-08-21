@@ -4,11 +4,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
     ffmpeg \
     curl \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 ENV SOLO_STUDIO_REQUIRE_API_TOKEN=1
+
+# Pin the provider CLI in the image. Real generation remains opt-in and still
+# requires an authenticated credentials file at deployment time.
+ARG HIGGSFIELD_CLI_VERSION=1.1.23
+RUN npm install --global "@higgsfield/cli@${HIGGSFIELD_CLI_VERSION}" \
+    && higgsfield --version
 
 # Python dependencies
 RUN pip install --no-cache-dir \
@@ -31,12 +39,12 @@ RUN mkdir -p /app/briefs /app/output
 # Nginx: proxy /api/* and /* to FastAPI on :8000
 RUN rm -f /etc/nginx/sites-enabled/default && \
     echo 'server { \
-        listen 9091; \
+        listen 127.0.0.1:9091; \
         location / { \
             proxy_pass http://127.0.0.1:8000; \
             proxy_set_header Host \$host; \
             proxy_set_header X-Real-IP \$remote_addr; \
-            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; \
+            proxy_set_header X-Forwarded-For \$remote_addr; \
             proxy_set_header X-Forwarded-Proto \$scheme; \
         } \
     }' > /etc/nginx/conf.d/default.conf
@@ -50,12 +58,24 @@ RUN printf '%s\n' \
     'cd /app' \
     'python api.py &' \
     'api_pid=$!' \
-    'python worker.py &' \
-    'worker_pid=$!' \
-    'wait -n "$nginx_pid" "$api_pid" "$worker_pid"' \
+    'worker_pid=""' \
+    'if [ "${SOLO_STUDIO_DISABLE_WORKER:-0}" != "1" ]; then' \
+    '  python worker.py &' \
+    '  worker_pid=$!' \
+    'fi' \
+    'if [ -n "$worker_pid" ]; then' \
+    '  wait -n "$nginx_pid" "$api_pid" "$worker_pid"' \
+    'else' \
+    '  wait -n "$nginx_pid" "$api_pid"' \
+    'fi' \
     'status=$?' \
-    'kill "$nginx_pid" "$api_pid" "$worker_pid" 2>/dev/null || true' \
-    'wait "$nginx_pid" "$api_pid" "$worker_pid" 2>/dev/null || true' \
+    'if [ -n "$worker_pid" ]; then' \
+    '  kill "$nginx_pid" "$api_pid" "$worker_pid" 2>/dev/null || true' \
+    '  wait "$nginx_pid" "$api_pid" "$worker_pid" 2>/dev/null || true' \
+    'else' \
+    '  kill "$nginx_pid" "$api_pid" 2>/dev/null || true' \
+    '  wait "$nginx_pid" "$api_pid" 2>/dev/null || true' \
+    'fi' \
     'exit "$status"' \
     > /app/start.sh && chmod +x /app/start.sh
 
