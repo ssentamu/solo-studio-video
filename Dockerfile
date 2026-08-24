@@ -43,29 +43,46 @@ RUN mkdir -p /app/briefs /app/output /app/state /home/solo/.config/higgsfield &&
     useradd --system --uid 10001 --create-home --home-dir /home/solo solo && \
     chown -R solo:solo /app /home/solo
 
-# Nginx: proxy /api/* and /* to FastAPI on :8000
-RUN mkdir -p /tmp/nginx-client /tmp/nginx-proxy && chown -R solo:solo /tmp/nginx-client /tmp/nginx-proxy && chmod 1777 /tmp/nginx-client /tmp/nginx-proxy && \
+# Nginx: proxy /api/* and /* to FastAPI on :8000. Keep the complete config
+# explicit so base-image log, pid, and temp paths remain non-root safe.
+RUN mkdir -p /tmp/nginx-client /tmp/nginx-proxy /tmp/nginx-fastcgi /tmp/nginx-uwsgi /tmp/nginx-scgi && \
+    chown -R solo:solo /tmp/nginx-client /tmp/nginx-proxy /tmp/nginx-fastcgi /tmp/nginx-uwsgi /tmp/nginx-scgi && \
+    chmod 1777 /tmp/nginx-client /tmp/nginx-proxy /tmp/nginx-fastcgi /tmp/nginx-uwsgi /tmp/nginx-scgi && \
     rm -f /etc/nginx/sites-enabled/default && \
-    echo 'client_body_temp_path /tmp/nginx-client; \
-    proxy_temp_path /tmp/nginx-proxy; \
-    error_log /dev/stderr warn; \
-    access_log /dev/stdout; \
-    server { \
+    printf '%s\n' \
+    'worker_processes 1;' \
+    'pid /tmp/nginx.pid;' \
+    'error_log /dev/stderr warn;' \
+    'events { worker_connections 1024; }' \
+    'http {' \
+    '    include /etc/nginx/mime.types;' \
+    '    default_type application/octet-stream;' \
+    '    access_log /dev/stdout;' \
+    '    sendfile on;' \
+    '    client_body_temp_path /tmp/nginx-client;' \
+    '    proxy_temp_path /tmp/nginx-proxy;' \
+    '    fastcgi_temp_path /tmp/nginx-fastcgi;' \
+    '    uwsgi_temp_path /tmp/nginx-uwsgi;' \
+    '    scgi_temp_path /tmp/nginx-scgi;' \
+    '    include /etc/nginx/conf.d/*.conf;' \
+    '}' > /etc/nginx/nginx.conf && \
+    echo 'server { \
         listen 127.0.0.1:9091; \
         location / { \
             proxy_pass http://127.0.0.1:8000; \
-            proxy_set_header Host \$host; \
-            proxy_set_header X-Real-IP \$remote_addr; \
-            proxy_set_header X-Forwarded-For \$remote_addr; \
-            proxy_set_header X-Forwarded-Proto \$scheme; \
+            proxy_set_header Host $host; \
+            proxy_set_header X-Real-IP $remote_addr; \
+            proxy_set_header X-Forwarded-For $remote_addr; \
+            proxy_set_header X-Forwarded-Proto $scheme; \
         } \
-    }' > /etc/nginx/conf.d/default.conf
+    }' > /etc/nginx/conf.d/default.conf && \
+    nginx -t -c /etc/nginx/nginx.conf
 
 # Start script — fail the container if any critical process exits.
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'set -euo pipefail' \
-    'nginx -g "error_log /dev/stderr warn; pid /tmp/nginx.pid; daemon off;" &' \
+    'nginx -g "error_log /dev/stderr warn; daemon off;" &' \
     'nginx_pid=$!' \
     'cd /app' \
     'python runtime_init.py' \
