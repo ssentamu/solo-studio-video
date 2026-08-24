@@ -88,7 +88,7 @@ class DeploymentSafetyTests(unittest.TestCase):
 
     def test_deployment_removals_are_verified_and_unknown_inspect_fails_closed(self):
         self.assertEqual(self.deploy.count('docker rm -f'), 1)
-        self.assertIn('grep -Fq "No such object"', self.deploy)
+        self.assertIn('grep -Eiq "No such (object|container)"', self.deploy)
         self.assertIn("return 2", self.deploy)
         remove_start = self.deploy.index("remove_container_and_verify()")
         remove_end = self.deploy.index("reconcile_replacement()")
@@ -157,7 +157,11 @@ class DeploymentSafetyTests(unittest.TestCase):
                 "      printf '%s\\n' 'daemon unavailable' >&2\n"
                 "      exit 2\n"
                 "    fi\n"
-                "    printf '%s\\n' 'No such object' >&2\n"
+                "    if [ \"$mode\" = no-such-container ]; then\n"
+                "      printf '%s\\n' 'Error response from daemon: No such container: solo-studio-video-release-preflight' >&2\n"
+                "    else\n"
+                "      printf '%s\\n' 'No such object' >&2\n"
+                "    fi\n"
                 "    exit 1\n"
                 "    ;;\n"
                 "esac\n"
@@ -221,6 +225,13 @@ class DeploymentSafetyTests(unittest.TestCase):
         cleanup_index = next(index for index, event in enumerate(events) if event.startswith("CLEANUP"))
         self.assertLess(run_index, remove_index)
         self.assertLess(remove_index, cleanup_index)
+
+    def test_preflight_accepts_docker_no_such_container_message(self):
+        completed, events, output = self.run_preflight_fake_docker("no-such-container")
+
+        self.assertEqual(completed.returncode, 0, output)
+        self.assertIn("RESULT=0", output)
+        self.assertLess(events.index("EXEC"), events.index("RM", events.index("RUN")))
 
     def test_preflight_ambiguous_removal_preserves_mount_directories(self):
         completed, events, output = self.run_preflight_fake_docker("ambiguous")

@@ -105,7 +105,7 @@ container_inspect_state() {
   else
     inspect_status=$?
   fi
-  if grep -Fq "No such object" <<<"$inspect_error"; then
+  if grep -Eiq "No such (object|container)" <<<"$inspect_error"; then
     return 1
   fi
   echo "Docker inspect for $container_name failed (status=$inspect_status); container state is unknown." >&2
