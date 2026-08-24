@@ -8,7 +8,9 @@ Supports: short (<2min), medium (2-10min), long (10-30min), documentary (30+min)
 """
 import json, sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dataclasses import dataclass, field, asdict
+from package_utils import atomic_write_json, atomic_write_text, read_json_artifact
 from enum import Enum
 
 
@@ -62,8 +64,7 @@ def detect_format(duration_seconds: float) -> VideoFormat:
 
 
 def load_brief(brief_path: str) -> dict:
-    with open(brief_path) as f:
-        return json.load(f)
+    return read_json_artifact(brief_path)
 
 
 def generate_chapter_plan(duration: float, fmt: VideoFormat, messages: list[str]) -> list[Chapter]:
@@ -377,19 +378,17 @@ def main():
 
     # Write script text
     script_path = output_dir / "script.txt"
-    with open(script_path, 'w') as f:
-        f.write(storyboard.full_script)
+    atomic_write_text(script_path, storyboard.full_script)
 
     # Write storyboard JSON
     sb_path = output_dir / "storyboard.json"
-    with open(sb_path, 'w') as f:
-        json.dump({
-            'title': storyboard.title,
-            'format': storyboard.format,
-            'total_duration': storyboard.total_duration,
-            'chapters': [asdict(c) for c in storyboard.chapters],
-            'scenes': [asdict(s) for s in storyboard.scenes],
-        }, f, indent=2)
+    atomic_write_json(sb_path, {
+        'title': storyboard.title,
+        'format': storyboard.format,
+        'total_duration': storyboard.total_duration,
+        'chapters': [asdict(c) for c in storyboard.chapters],
+        'scenes': [asdict(s) for s in storyboard.scenes],
+    })
 
     print(f"Script: {script_path}")
     print(f"  Format: {storyboard.format}")

@@ -6,8 +6,10 @@ Output: creative_brief.json
 """
 import json, sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+from package_utils import atomic_write_json, read_json_artifact, read_text_artifact
 
 @dataclass
 class CreativeBrief:
@@ -26,16 +28,11 @@ class CreativeBrief:
 def load_input(brief_path: str) -> dict:
     """Load brief from YAML or JSON."""
     path = Path(brief_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Brief not found: {brief_path}")
-
     if path.suffix in ('.yaml', '.yml'):
         import yaml
-        with open(path) as f:
-            return yaml.safe_load(f)
+        return yaml.safe_load(read_text_artifact(path))
     else:
-        with open(path) as f:
-            return json.load(f)
+        return read_json_artifact(path)
 
 
 def generate_brief(raw: dict) -> CreativeBrief:
@@ -109,8 +106,7 @@ def main():
 
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "creative_brief.json"
-    with open(out_path, 'w') as f:
-        json.dump(asdict(brief), f, indent=2)
+    atomic_write_json(out_path, asdict(brief))
 
     print(f"Creative brief: {out_path}")
     print(f"  Topic: {brief.topic}")

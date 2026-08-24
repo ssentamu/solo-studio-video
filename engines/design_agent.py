@@ -6,11 +6,12 @@ Output: visuals/ directory with generated images
 """
 import json, sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from package_utils import atomic_write_json, read_json_artifact
 
 
 def load_storyboard(path: str) -> dict:
-    with open(path) as f:
-        return json.load(f)
+    return read_json_artifact(path)
 
 
 def generate_visual_prompts(storyboard: dict, visual_style: str = "") -> list[dict]:
@@ -48,8 +49,7 @@ def write_prompts_manifest(prompts: list[dict], output_dir: Path) -> Path:
         'prompts': prompts,
     }
     path = output_dir / "visual_prompts.json"
-    with open(path, 'w') as f:
-        json.dump(manifest, f, indent=2)
+    atomic_write_json(path, manifest)
     return path
 
 
@@ -92,18 +92,15 @@ def main():
     brief_path = output_dir / "creative_brief.json"
     visual_style = ""
     if brief_path.exists():
-        with open(brief_path) as f:
-            brief = json.load(f)
-            visual_style = brief.get('visual_style', '')
+        brief = read_json_artifact(brief_path)
+        visual_style = brief.get('visual_style', '')
 
     # Generate thumbnail prompt
     if brief_path.exists():
-        with open(brief_path) as f:
-            brief = json.load(f)
-            thumbnail = generate_thumbnail_prompt(storyboard, brief)
-            with open(output_dir / "thumbnail_prompt.json", 'w') as tf:
-                json.dump(thumbnail, tf, indent=2)
-            print(f"  Thumbnail: {output_dir / 'thumbnail_prompt.json'}")
+        brief = read_json_artifact(brief_path)
+        thumbnail = generate_thumbnail_prompt(storyboard, brief)
+        atomic_write_json(output_dir / "thumbnail_prompt.json", thumbnail)
+        print(f"  Thumbnail: {output_dir / 'thumbnail_prompt.json'}")
 
     prompts = generate_visual_prompts(storyboard, visual_style)
     manifest_path = write_prompts_manifest(prompts, output_dir)

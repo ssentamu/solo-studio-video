@@ -10,6 +10,7 @@ scene fails, so the worker cannot mark an editor-only package as fully successfu
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import http.client
 import ipaddress
@@ -18,14 +19,20 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from package_utils import _open_directory_no_follow, atomic_write_json, read_json_artifact, remove_matching_files
 
 DEFAULT_MODEL = os.environ.get("SOLO_STUDIO_HIGGSFIELD_MODEL", "seedance_2_0")
 TRUTHY = {"1", "true", "yes", "on"}
@@ -38,8 +45,7 @@ def higgsfield_enabled() -> bool:
 
 
 def load_json(path: str | Path) -> dict[str, Any]:
-    with open(path) as handle:
-        return json.load(handle)
+    return read_json_artifact(path)
 
 
 def sanitize_prompt(text: str) -> str:
@@ -119,47 +125,55 @@ def _provider_status_is_usable(payload: Any) -> bool:
     return True
 
 
-def _verify_clip(path: Path) -> tuple[bool, str | None]:
+def _verify_clip(path: Path, *, _descriptor: int | None = None) -> tuple[bool, str | None]:
     """Require an MP4 signature and a positive ffprobe duration before publish."""
-    if path.stat().st_size < 12:
-        return False, "Provider returned an invalid or empty MP4 file."
-    with path.open("rb") as handle:
-        header = handle.read(12)
-    if header[4:8] != b"ftyp":
-        return False, "Provider returned a non-MP4 artifact."
-    ffprobe = shutil.which("ffprobe")
-    if not ffprobe:
-        return False, "ffprobe is required to verify generated clips."
+    descriptor_owned = _descriptor is None
     try:
-        probe = subprocess.run(
-            [
-                ffprobe,
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_type:format=duration",
-                "-of", "json",
-                str(path),
-            ],
-            text=True,
-            capture_output=True,
-            timeout=30,
-            check=False,
+        if descriptor_owned and (not path.is_absolute() or path.resolve(strict=True) != path):
+            return False, "Provider returned an artifact outside the canonical clip path."
+        descriptor = _descriptor if _descriptor is not None else os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False, "ffprobe could not verify the generated clip."
-    if probe.returncode != 0:
-        return False, "ffprobe rejected the generated clip."
+    except OSError:
+        return False, "Provider returned an unavailable MP4 artifact."
     try:
-        probe_payload = json.loads(probe.stdout)
-        streams = probe_payload.get("streams", [])
-        if not any(stream.get("codec_type") == "video" for stream in streams if isinstance(stream, dict)):
-            return False, "Generated clip contains no video stream."
-        duration = float(probe_payload.get("format", {}).get("duration"))
-    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
-        return False, "ffprobe returned no usable clip duration."
-    if not math.isfinite(duration) or duration <= 0:
-        return False, "Generated clip duration must be positive."
-    return True, None
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size < 12:
+            return False, "Provider returned an invalid or empty MP4 file."
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        header = os.read(descriptor, 12)
+        if header[4:8] != b"ftyp":
+            return False, "Provider returned a non-MP4 artifact."
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return False, "ffprobe is required to verify generated clips."
+        try:
+            probe = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_type:format=duration", "-of", "json",
+                 f"/proc/self/fd/{descriptor}"],
+                text=True, capture_output=True, timeout=30, check=False,
+                pass_fds=(descriptor,),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False, "ffprobe could not verify the generated clip."
+        if probe.returncode != 0:
+            return False, "ffprobe rejected the generated clip."
+        try:
+            probe_payload = json.loads(probe.stdout)
+            streams = probe_payload.get("streams", [])
+            if not any(stream.get("codec_type") == "video" for stream in streams if isinstance(stream, dict)):
+                return False, "Generated clip contains no video stream."
+            duration = float(probe_payload.get("format", {}).get("duration"))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return False, "ffprobe returned no usable clip duration."
+        if not math.isfinite(duration) or duration <= 0:
+            return False, "Generated clip duration must be positive."
+        return True, None
+    finally:
+        if descriptor_owned:
+            os.close(descriptor)
 
 
 def _public_provider_ip(url: str) -> str:
@@ -223,6 +237,95 @@ def _open_provider_url(url: str):
     return opener.open(url, timeout=120)
 
 
+def _retry_settings() -> tuple[int, float]:
+    try:
+        attempts = max(1, min(5, int(os.environ.get("SOLO_STUDIO_PROVIDER_RETRY_ATTEMPTS", "3"))))
+    except ValueError:
+        attempts = 3
+    try:
+        base_delay = max(0.0, min(60.0, float(os.environ.get("SOLO_STUDIO_PROVIDER_RETRY_BASE_SECONDS", "1"))))
+    except ValueError:
+        base_delay = 1.0
+    return attempts, base_delay
+
+
+def _sleep_before_retry(attempt: int, base_delay: float) -> None:
+    if base_delay <= 0:
+        return
+    time.sleep(min(60.0, base_delay * (2 ** max(0, attempt - 1))))
+
+
+def _retryable_download_error(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429 or 500 <= exc.code <= 599
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(exc.reason, (TimeoutError, socket.timeout, ConnectionError, OSError))
+    return isinstance(exc, (TimeoutError, socket.timeout, ConnectionError))
+
+
+def _download_provider_artifact(url: str, destination: Path) -> tuple[int, int, int, str]:
+    """Download with bounded retry for transport errors only."""
+    attempts, base_delay = _retry_settings()
+    last_error: Exception | None = None
+    directory_fd = _open_directory_no_follow(destination.parent, create=False)
+    temporary_name = f".{destination.name}.part-{os.getpid()}-{os.urandom(8).hex()}"
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+    except Exception:
+        os.close(directory_fd)
+        raise
+    try:
+        for attempt in range(1, attempts + 1):
+            try:
+                os.ftruncate(descriptor, 0)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                total = 0
+                with os.fdopen(os.dup(descriptor), "wb") as handle, _open_provider_url(url) as response:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > MAX_CLIP_BYTES:
+                            raise ValueError("Provider artifact exceeds the configured size limit.")
+                        handle.write(chunk)
+                if total == 0:
+                    raise ValueError("Provider returned an empty video file.")
+                os.fsync(descriptor)
+                # Transfer ownership of the still-open descriptor and its
+                # parent directory to the caller. The caller must verify and
+                # publish this exact inode before either descriptor is closed.
+                result = (total, descriptor, directory_fd, temporary_name)
+                descriptor = -1
+                directory_fd = -1
+                temporary_name = ""
+                return result
+            except ValueError:
+                raise
+            except Exception as exc:
+                if not _retryable_download_error(exc):
+                    raise RuntimeError("provider artifact download failed") from exc
+                last_error = exc
+                if attempt < attempts:
+                    _sleep_before_retry(attempt, base_delay)
+        raise RuntimeError("provider artifact download failed") from last_error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_name and directory_fd >= 0:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
 def run_higgsfield(prompt: str, duration: float, out_file: Path, model: str) -> dict[str, Any]:
     command = [
         "higgsfield", "generate", "create", model,
@@ -232,6 +335,10 @@ def run_higgsfield(prompt: str, duration: float, out_file: Path, model: str) -> 
         "--resolution", os.environ.get("SOLO_STUDIO_HIGGSFIELD_RESOLUTION", "720p"),
         "--wait", "--json",
     ]
+    # Submission is intentionally single-shot.  With --wait, a timeout or
+    # non-zero exit may still mean the provider accepted remote work; retrying
+    # the whole command can create duplicate billable generations.  Only the
+    # subsequent artifact download has bounded transport retries.
     try:
         process = subprocess.run(
             command,
@@ -272,51 +379,70 @@ def run_higgsfield(prompt: str, duration: float, out_file: Path, model: str) -> 
         result["error"] = "Provider completed without an HTTPS video URL."
         return result
 
-    temporary_handle = tempfile.NamedTemporaryFile(
-        mode="wb",
-        prefix=f".{out_file.name}.",
-        suffix=".part",
-        dir=out_file.parent,
-        delete=False,
-    )
-    temporary_file = Path(temporary_handle.name)
+    temporary_file = out_file.with_name(f".{out_file.name}.part-{os.getpid()}-{os.urandom(8).hex()}")
+    download_fd = -1
+    download_directory_fd = -1
+    temporary_name = ""
+    published_bytes = 0
     try:
-        total = 0
-        with temporary_handle as handle, _open_provider_url(result_url) as response:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > MAX_CLIP_BYTES:
-                    raise ValueError("Provider artifact exceeds the configured size limit.")
-                handle.write(chunk)
+        total, download_fd, download_directory_fd, temporary_name = _download_provider_artifact(result_url, temporary_file)
         if total == 0:
             raise ValueError("Provider returned an empty video file.")
-        valid, verification_error = _verify_clip(temporary_file)
+        os.lseek(download_fd, 0, os.SEEK_SET)
+        temporary_file_bound = Path(f"/proc/self/fd/{download_directory_fd}/{temporary_name}")
+        valid, verification_error = _verify_clip(temporary_file_bound, _descriptor=download_fd)
         if not valid:
             result["status"] = "failed"
             result["error"] = verification_error
             return result
-        temporary_file.replace(out_file)
+        # Publish the inode that was verified, not whatever later appears
+        # under the temporary pathname. Existing destinations are refused.
+        os.link(
+            f"/proc/self/fd/{download_fd}",
+            out_file.name,
+            dst_dir_fd=download_directory_fd,
+            follow_symlinks=True,
+        )
+        os.unlink(temporary_name, dir_fd=download_directory_fd)
+        os.fsync(download_directory_fd)
+        published_stat = os.stat(out_file.name, dir_fd=download_directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(published_stat.st_mode):
+            raise ValueError("published provider artifact is not a regular file")
+        os.lseek(download_fd, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: os.read(download_fd, 1024 * 1024), b""):
+            digest.update(chunk)
+        published_sha256 = digest.hexdigest()
+        published_bytes = published_stat.st_size
     except Exception:
         result["status"] = "failed"
         result["error"] = "Video download failed; check provider logs on the host."
         return result
     finally:
-        temporary_file.unlink(missing_ok=True)
+        try:
+            if temporary_name and download_directory_fd >= 0:
+                os.unlink(temporary_name, dir_fd=download_directory_fd)
+        except FileNotFoundError:
+            pass
+        if download_fd >= 0:
+            os.close(download_fd)
+        if download_directory_fd >= 0:
+            os.close(download_directory_fd)
 
-    result.update({"status": "downloaded", "output_file": str(out_file), "bytes": out_file.stat().st_size, "duration_verified": True})
+    result.update({"status": "downloaded", "output_file": str(out_file), "bytes": published_bytes, "sha256": published_sha256, "duration_verified": True})
     return result
 
 
 def generate_plan(video_prompts_path: str | Path, output_dir: str | Path) -> dict[str, Any]:
     output_dir = Path(output_dir)
     clips_dir = output_dir / "clips"
-    clips_dir.mkdir(parents=True, exist_ok=True)
+    output_directory_fd = _open_directory_no_follow(output_dir, create=True)
+    os.close(output_directory_fd)
+    clips_directory_fd = _open_directory_no_follow(clips_dir, create=True)
+    os.close(clips_directory_fd)
     try:
         prompts = load_json(video_prompts_path)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
         prompts = None
     model = os.environ.get("SOLO_STUDIO_HIGGSFIELD_MODEL", DEFAULT_MODEL)
     binary = shutil.which("higgsfield")
@@ -340,7 +466,7 @@ def generate_plan(video_prompts_path: str | Path, output_dir: str | Path) -> dic
         plan["reason"] = "Video prompts must be a JSON object with a scenes list."
         plan["setup_needed"] = plan["reason"]
         plan["total_scenes"] = 0
-        (clips_dir / "generation_plan.json").write_text(json.dumps(plan, indent=2))
+        atomic_write_json(clips_dir / "generation_plan.json", plan)
         return plan
     scenes = prompts.get("scenes", [])
     if not isinstance(scenes, list) or not scenes:
@@ -348,7 +474,18 @@ def generate_plan(video_prompts_path: str | Path, output_dir: str | Path) -> dic
         plan["reason"] = "No scenes were available: video prompts must contain a non-empty scenes list."
         plan["setup_needed"] = plan["reason"]
         plan["total_scenes"] = 0
-        (clips_dir / "generation_plan.json").write_text(json.dumps(plan, indent=2))
+        atomic_write_json(clips_dir / "generation_plan.json", plan)
+        return plan
+    try:
+        max_scenes = max(1, int(os.getenv("SOLO_STUDIO_MAX_GENERATION_SCENES", "50")))
+    except ValueError:
+        max_scenes = 50
+    if len(scenes) > max_scenes:
+        plan["status"] = "failed"
+        plan["reason"] = "Scene count exceeds the configured generation limit."
+        plan["setup_needed"] = plan["reason"]
+        plan["total_scenes"] = len(scenes)
+        atomic_write_json(clips_dir / "generation_plan.json", plan)
         return plan
     scene_numbers = [scene.get("scene_number") for scene in scenes if isinstance(scene, dict)]
     malformed_numbers = (
@@ -362,7 +499,7 @@ def generate_plan(video_prompts_path: str | Path, output_dir: str | Path) -> dic
         plan["reason"] = "Scenes must have contiguous unique positive integer scene numbers starting at 1."
         plan["setup_needed"] = plan["reason"]
         plan["total_scenes"] = len(scenes)
-        (clips_dir / "generation_plan.json").write_text(json.dumps(plan, indent=2))
+        atomic_write_json(clips_dir / "generation_plan.json", plan)
         return plan
     prompt_fields = (
         "visual_description", "kling_prompt", "runway_prompt", "pika_prompt",
@@ -377,7 +514,7 @@ def generate_plan(video_prompts_path: str | Path, output_dir: str | Path) -> dic
         plan["reason"] = "Scene prompt fields must be strings when provided."
         plan["setup_needed"] = plan["reason"]
         plan["total_scenes"] = len(scenes)
-        (clips_dir / "generation_plan.json").write_text(json.dumps(plan, indent=2))
+        atomic_write_json(clips_dir / "generation_plan.json", plan)
         return plan
     durations: list[float] = []
     try:
@@ -394,21 +531,23 @@ def generate_plan(video_prompts_path: str | Path, output_dir: str | Path) -> dic
         plan["reason"] = "Scene durations must be finite positive numbers."
         plan["setup_needed"] = plan["reason"]
         plan["total_scenes"] = len(scenes)
-        (clips_dir / "generation_plan.json").write_text(json.dumps(plan, indent=2))
+        atomic_write_json(clips_dir / "generation_plan.json", plan)
         return plan
-    for stale_clip in clips_dir.glob("scene_*.mp4"):
-        try:
-            stale_clip.unlink()
-        except OSError:
-            pass
+    try:
+        remove_matching_files(clips_dir, "scene_*.mp4")
+    except OSError:
+        plan["status"] = "failed"
+        plan["reason"] = "The clips directory is not a safe regular directory."
+        plan["setup_needed"] = plan["reason"]
+        atomic_write_json(clips_dir / "generation_plan.json", plan)
+        return plan
     all_downloaded = real_mode and bool(scenes)
     if real_mode and not scenes:
         plan["status"] = "failed"
         plan["reason"] = "No scenes were available for provider generation."
         plan["setup_needed"] = plan["reason"]
         plan["total_scenes"] = 0
-        plan_path = clips_dir / "generation_plan.json"
-        plan_path.write_text(json.dumps(plan, indent=2))
+        atomic_write_json(clips_dir / "generation_plan.json", plan)
         return plan
     for scene, duration in zip(scenes, durations):
         number = int(scene.get("scene_number", len(plan["scenes"]) + 1))
@@ -435,8 +574,7 @@ def generate_plan(video_prompts_path: str | Path, output_dir: str | Path) -> dic
         plan["reason"] = None if all_downloaded else "One or more provider clips failed or were not downloaded."
         plan["setup_needed"] = plan["reason"]
     plan["total_scenes"] = len(plan["scenes"])
-    plan_path = clips_dir / "generation_plan.json"
-    plan_path.write_text(json.dumps(plan, indent=2))
+    atomic_write_json(clips_dir / "generation_plan.json", plan)
     return plan
 
 

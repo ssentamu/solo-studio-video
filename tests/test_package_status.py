@@ -1,5 +1,7 @@
+import hashlib
 import json
 import io
+import os
 import threading
 import re
 import stat
@@ -278,6 +280,44 @@ class PackageStatusTests(unittest.TestCase):
             self.assertFalse(status["has_clips"])
             self.assertNotEqual(status["package_status"], "clips_generated")
 
+    def test_clip_lock_partial_and_temp_artifacts_block_complete_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "storyboard.json").write_text(json.dumps({"scenes": [{"scene_number": 1}]}))
+            clips = root / "clips"
+            clips.mkdir()
+            clip = clips / "scene_01.mp4"
+            clip.write_bytes(b"verified clip")
+            (clips / "generation_plan.json").write_text(json.dumps({
+                "status": "completed",
+                "total_scenes": 1,
+                "scenes": [{
+                    "scene_number": 1,
+                    "status": "verified",
+                    "target_file": "clips/scene_01.mp4",
+                    "sha256": hashlib.sha256(clip.read_bytes()).hexdigest(),
+                }],
+            }))
+            artifact_names = ("scene_01.mp4.lock", "scene_01.mp4.part-worker", "scene_01.mp4.tmp")
+            for name in artifact_names:
+                (clips / name).write_bytes(b"transient artifact")
+            (clips / "scene_01.mp4.symlink").symlink_to(clip)
+            os.mkfifo(clips / "scene_01.mp4.fifo")
+            invalid_names = sorted((*artifact_names, "scene_01.mp4.symlink", "scene_01.mp4.fifo"))
+
+            def fake_probe(path):
+                if path.name == "scene_01.mp4":
+                    return {"path": str(path), "exists": True, "size_bytes": 1, "ffprobe_checked": True, "valid": True, "duration_seconds": 1.0}
+                return {"path": str(path), "exists": False, "size_bytes": 0, "ffprobe_checked": False, "valid": False}
+
+            with patch("package_utils._probe_media", side_effect=fake_probe):
+                status = compute_package_status(root, "completed")
+
+            self.assertEqual(status["verified_clip_scene_numbers"], [1])
+            self.assertEqual(status["invalid_clip_files"], invalid_names)
+            self.assertFalse(status["has_clips"])
+            self.assertNotEqual(status["package_status"], "clips_generated")
+
     def test_extra_verified_clip_prevents_clips_generated_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -490,6 +530,19 @@ class GenerationAgentTests(unittest.TestCase):
             self.assertNotIn("provider-token-should-not-be-persisted", serialized)
             self.assertNotIn("stderr-token-should-not-be-persisted", serialized)
             self.assertNotIn("cdn.example.test", serialized)
+
+    def test_generation_agent_submission_is_single_shot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_file = Path(tmp) / "scene_01.mp4"
+            with patch.dict("os.environ", {"SOLO_STUDIO_HIGGSFIELD_TIMEOUT": "1"}), patch(
+                "engines.generation_agent.subprocess.run",
+                return_value=SimpleNamespace(returncode=2, stdout="", stderr="provider failure"),
+            ) as run:
+                result = run_higgsfield("secret prompt", 5, out_file, "seedance_2_0")
+
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(result["status"], "failed")
+            self.assertFalse(out_file.exists())
 
     def test_generation_agent_rejects_invalid_provider_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -858,6 +911,20 @@ class WorkerFlowTests(unittest.TestCase):
             self.assertEqual(saved["job"]["scenes"], 5)
             self.assertEqual(saved["job"]["package_status"], saved["package_status"])
 
+    def test_sqlite_manifest_snapshot_reads_job_directly_not_capped_list(self):
+        import worker
+
+        fallback = {"id": "old-job", "status": "queued"}
+        persisted = {"id": "old-job", "status": "completed", "final_video_sha256": "a" * 64}
+        with patch.object(worker, "DATABASE_CONFIGURED", True), patch.object(
+            worker.job_store, "get_job", return_value=persisted
+        ) as get_job:
+            snapshot = worker._manifest_job_snapshot("old-job", fallback)
+
+        get_job.assert_called_once_with("old-job", path=worker.DATABASE_FILE)
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(snapshot["final_video_sha256"], "a" * 64)
+
     def test_worker_stage_timeout_returns_false_instead_of_crashing(self):
         import subprocess
         import worker
@@ -884,6 +951,24 @@ class WorkerFlowTests(unittest.TestCase):
             manifest = root / "output" / "corrupt-job" / "package_manifest.json"
             self.assertTrue(manifest.is_file())
             self.assertEqual((root / "jobs.json").read_text(), '{"broken":')
+
+    def test_worker_failure_manifest_survives_unreadable_sqlite_cancellation_state(self):
+        import worker
+
+        old_database_configured = worker.DATABASE_CONFIGURED
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job = {"id": "corrupt-sqlite", "topic": "Bad database", "status": "running"}
+            try:
+                worker.DATABASE_CONFIGURED = True
+                with patch("worker._job_is_cancelled", side_effect=OSError("database is corrupt")), patch(
+                    "worker.load_jobs", return_value={}
+                ), patch("worker.update_job", side_effect=OSError("database is corrupt")):
+                    worker._fail_job(job["id"], root / job["id"], job, "stage failed")
+            finally:
+                worker.DATABASE_CONFIGURED = old_database_configured
+
+            self.assertTrue((root / job["id"] / "package_manifest.json").is_file())
 
     def test_worker_failure_finalizer_persists_fallback_when_manifest_write_fails(self):
         import worker
@@ -923,6 +1008,24 @@ class WorkerFlowTests(unittest.TestCase):
         ):
             with self.assertRaises(KeyboardInterrupt):
                 worker.main()
+
+    def test_package_status_rejects_symlinked_storyboard_and_visuals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "job"
+            root.mkdir()
+            external_storyboard = Path(tmp) / "external-storyboard.json"
+            external_storyboard.write_text(json.dumps({"scenes": [{"scene_number": 1}]}))
+            (root / "storyboard.json").symlink_to(external_storyboard)
+            (root / "visuals").mkdir()
+            external_visual = Path(tmp) / "external.png"
+            external_visual.write_bytes(b"\x89PNG\r\n\x1a\nexternal")
+            (root / "visuals" / "scene_01.png").symlink_to(external_visual)
+
+            summary = compute_package_status(root)
+
+            self.assertFalse(summary["artifacts"]["storyboard"])
+            self.assertEqual(summary["expected_scenes"], 0)
+            self.assertFalse(summary["has_visuals"])
 
 
 class FrontendContractTests(unittest.TestCase):
@@ -1395,6 +1498,8 @@ class ApiPackageStatusTests(unittest.TestCase):
         self.assertIn("wait -n", dockerfile)
         self.assertIn("ENV SOLO_STUDIO_REQUIRE_API_TOKEN=1", dockerfile)
         self.assertIn("nginx_pid=$!", dockerfile)
+        self.assertIn('nginx -g "error_log /dev/stderr warn; pid /tmp/nginx.pid; daemon off;"', dockerfile)
+        self.assertNotIn("echo 'pid /tmp/nginx.pid;", dockerfile)
         self.assertIn("api_pid=$!", dockerfile)
         self.assertIn("worker_pid=$!", dockerfile)
         self.assertIn("if [ -n \"$worker_pid\" ]; then", dockerfile)
@@ -1414,6 +1519,7 @@ class ApiPackageStatusTests(unittest.TestCase):
 
     def test_deploy_script_requires_token_and_smokes_protected_jobs_route(self):
         deploy = (ROOT / "deploy-traefik.sh").read_text()
+        dockerfile = (ROOT / "Dockerfile").read_text()
 
         self.assertIn("SOLO_STUDIO_API_TOKEN:?", deploy)
         self.assertIn("-e SOLO_STUDIO_API_TOKEN", deploy)
@@ -1435,7 +1541,8 @@ class ApiPackageStatusTests(unittest.TestCase):
         self.assertIn('curl "${CURL_BOUNDED[@]}" -fsS --config "$curl_config"', deploy)
         self.assertNotIn('curl -fsS -H "Authorization: Bearer ***', deploy)
         self.assertIn("https://edgescout.tech/video/api/jobs?limit=1", deploy)
-        self.assertIn("SOLO_STUDIO_DISABLE_WORKER=1", deploy)
+        self.assertNotIn("SOLO_STUDIO_DISABLE_WORKER=1", deploy)
+        self.assertIn("python runtime_init.py", dockerfile)
 
     def test_deploy_script_tags_named_rollback_image_before_live_replacement(self):
         deploy = (ROOT / "deploy-traefik.sh").read_text()
@@ -1443,8 +1550,12 @@ class ApiPackageStatusTests(unittest.TestCase):
         self.assertIn("rollback_tag=\"solo-studio-video:rollback-", deploy)
         self.assertIn("docker tag \"$current_image\" \"$rollback_tag\"", deploy)
         self.assertIn("rollback_live", deploy)
-        self.assertIn("run_container_preflight \"$rollback_tag\"", deploy)
-        self.assertIn('run_container "$release_tag"', deploy)
+        self.assertIn("preflight_image \"$rollback_tag\" rollback", deploy)
+        self.assertIn("preflight_release_image", deploy)
+        self.assertLess(deploy.index("preflight_release_image\n\ncurl_config"), deploy.index('remove_container_and_verify "$APP_NAME"', deploy.index("=== Deploying on edgescout.tech/video ===")))
+        self.assertIn("SOLO_STUDIO_EXPECTED_RUNTIME_UID", deploy)
+        self.assertIn("python -c \"import api, job_store, worker\"", deploy)
+        self.assertIn('start_container_and_reconcile "$release_tag"', deploy)
         self.assertIn("container_replaced=0", deploy)
         self.assertIn("container_replaced=1", deploy)
         self.assertIn("Container was not replaced yet; leaving existing service untouched.", deploy)

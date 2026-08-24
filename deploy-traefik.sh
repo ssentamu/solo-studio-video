@@ -16,13 +16,26 @@ SOLO_STUDIO_HIGGSFIELD_RESOLUTION=${SOLO_STUDIO_HIGGSFIELD_RESOLUTION:-720p}
 SOLO_STUDIO_HIGGSFIELD_TIMEOUT=${SOLO_STUDIO_HIGGSFIELD_TIMEOUT:-900}
 SOLO_STUDIO_CURL_CONNECT_TIMEOUT=${SOLO_STUDIO_CURL_CONNECT_TIMEOUT:-5}
 SOLO_STUDIO_CURL_MAX_TIME=${SOLO_STUDIO_CURL_MAX_TIME:-15}
+SOLO_STUDIO_CONTAINER_MEMORY=${SOLO_STUDIO_CONTAINER_MEMORY:-2g}
+SOLO_STUDIO_CONTAINER_CPUS=${SOLO_STUDIO_CONTAINER_CPUS:-2}
+SOLO_STUDIO_CONTAINER_PIDS_LIMIT=${SOLO_STUDIO_CONTAINER_PIDS_LIMIT:-512}
 HIGGSFIELD_CREDENTIALS_FILE=${HIGGSFIELD_CREDENTIALS_FILE:-$HOME/.config/higgsfield/credentials.json}
 HIGGSFIELD_CREDENTIALS_MOUNT=()
 CURL_BOUNDED=(--connect-timeout "$SOLO_STUDIO_CURL_CONNECT_TIMEOUT" --max-time "$SOLO_STUDIO_CURL_MAX_TIME")
+DOCKER_RESOURCE_ARGS=(--memory "$SOLO_STUDIO_CONTAINER_MEMORY" --cpus "$SOLO_STUDIO_CONTAINER_CPUS" --pids-limit "$SOLO_STUDIO_CONTAINER_PIDS_LIMIT")
+CONTAINER_USER_ARGS=()
 release_tag=""
 rollback_tag=""
 curl_config=""
 container_replaced=0
+removal_started=0
+removal_confirmed=0
+replacement_started=0
+active_child_pid=""
+PREFLIGHT_STATE_DIR=""
+PREFLIGHT_OUTPUT_DIR=""
+PREFLIGHT_DIRS_SAFE_TO_DELETE=0
+existing_container_found=0
 
 case "${SOLO_STUDIO_ENABLE_HIGGSFIELD,,}" in
   1|true|yes|on) SOLO_STUDIO_ENABLE_HIGGSFIELD=1 ;;
@@ -36,7 +49,7 @@ if [ "$SOLO_STUDIO_ENABLE_HIGGSFIELD" = "1" ]; then
     exit 1
   fi
   HIGGSFIELD_CREDENTIALS_MOUNT=(
-    -v "$HIGGSFIELD_CREDENTIALS_FILE:/root/.config/higgsfield/credentials.json:ro"
+    -v "$HIGGSFIELD_CREDENTIALS_FILE:/home/solo/.config/higgsfield/credentials.json:ro"
   )
 fi
 
@@ -44,18 +57,154 @@ cleanup() {
   if [ -n "$curl_config" ]; then
     rm -f "$curl_config"
   fi
+  if [ "$PREFLIGHT_DIRS_SAFE_TO_DELETE" = "1" ]; then
+    if [ -n "$PREFLIGHT_STATE_DIR" ]; then
+      rm -rf "$PREFLIGHT_STATE_DIR"
+    fi
+    if [ -n "$PREFLIGHT_OUTPUT_DIR" ]; then
+      rm -rf "$PREFLIGHT_OUTPUT_DIR"
+    fi
+  elif [ -n "$PREFLIGHT_STATE_DIR" ] || [ -n "$PREFLIGHT_OUTPUT_DIR" ]; then
+    echo "Preserving preflight directories because Docker container absence was not verified." >&2
+  fi
+  PREFLIGHT_STATE_DIR=""
+  PREFLIGHT_OUTPUT_DIR=""
+}
+
+clear_preflight_dirs() {
+  if [ "$PREFLIGHT_DIRS_SAFE_TO_DELETE" != "1" ]; then
+    echo "Refusing to delete preflight directories before Docker container absence is verified." >&2
+    return 1
+  fi
+  if [ -n "$PREFLIGHT_STATE_DIR" ]; then
+    rm -rf "$PREFLIGHT_STATE_DIR"
+  fi
+  if [ -n "$PREFLIGHT_OUTPUT_DIR" ]; then
+    rm -rf "$PREFLIGHT_OUTPUT_DIR"
+  fi
+  PREFLIGHT_STATE_DIR=""
+  PREFLIGHT_OUTPUT_DIR=""
+  PREFLIGHT_DIRS_SAFE_TO_DELETE=0
+}
+
+run_tracked() {
+  "$@" &
+  active_child_pid=$!
+  local status=0
+  wait "$active_child_pid" || status=$?
+  active_child_pid=""
+  return "$status"
+}
+
+container_inspect_state() {
+  local container_name="$1"
+  local inspect_error=""
+  local inspect_status=0
+  if inspect_error=$(docker inspect "$container_name" 2>&1 >/dev/null); then
+    return 0
+  else
+    inspect_status=$?
+  fi
+  if grep -Fq "No such object" <<<"$inspect_error"; then
+    return 1
+  fi
+  echo "Docker inspect for $container_name failed (status=$inspect_status); container state is unknown." >&2
+  return 2
+}
+
+remove_container_and_verify() {
+  local container_name="$1"
+  local remove_status=0
+  local inspect_status=0
+  if run_tracked docker rm -f "$container_name" >/dev/null 2>&1; then
+    :
+  else
+    remove_status=$?
+  fi
+  if container_inspect_state "$container_name"; then
+    echo "Docker still reports container $container_name after removal." >&2
+    return 1
+  else
+    inspect_status=$?
+  fi
+  case "$inspect_status" in
+    1)
+      if [ "$remove_status" -ne 0 ]; then
+        echo "docker rm for $container_name returned status=$remove_status, but Docker confirmed the container is absent." >&2
+      fi
+      return 0
+      ;;
+    *)
+      echo "Refusing to continue after removing $container_name because Docker did not confirm its absence." >&2
+      return 1
+      ;;
+  esac
+}
+
+reconcile_replacement() {
+  local inspect_status=0
+  if container_inspect_state "$APP_NAME"; then
+    container_replaced=1
+    return 0
+  else
+    inspect_status=$?
+  fi
+  case "$inspect_status" in
+    1)
+      container_replaced=0
+      return 1
+      ;;
+    *)
+      echo "Replacement container state is unknown; refusing destructive rollback actions." >&2
+      return 2
+      ;;
+  esac
+}
+
+start_container_and_reconcile() {
+  local image_tag="$1"
+  local run_status=0
+  local reconcile_status=0
+  replacement_started=1
+  container_replaced=0
+  if run_container "$image_tag" >/dev/null; then
+    :
+  else
+    run_status=$?
+  fi
+  if reconcile_replacement; then
+    if [ "$run_status" -ne 0 ]; then
+      echo "docker run returned status=$run_status, but Docker confirmed the replacement container exists; continuing with health checks." >&2
+    fi
+    return 0
+  else
+    reconcile_status=$?
+  fi
+  case "$reconcile_status" in
+    1)
+      echo "Replacement container is absent after docker run (status=$run_status)." >&2
+      return 1
+      ;;
+    *)
+      echo "Replacement container existence could not be reconciled after docker run; refusing rollback mutation." >&2
+      return 2
+      ;;
+  esac
 }
 
 run_container() {
   local image_tag="$1"
   local container_name="${2:-$APP_NAME}"
   local network_mode="${3:-host}"
-  docker run -d \
+  run_tracked docker run -d \
     --name "$container_name" \
     --network "$network_mode" \
     --restart unless-stopped \
+    "${DOCKER_RESOURCE_ARGS[@]}" \
+    "${CONTAINER_USER_ARGS[@]}" \
     -e SOLO_STUDIO_API_TOKEN \
     -e SOLO_STUDIO_JOBS_FILE=/app/state/jobs.json \
+    -e SOLO_STUDIO_DATABASE_FILE=/app/state/solo_studio.sqlite3 \
     -e SOLO_STUDIO_REQUIRE_API_TOKEN=1 \
     -e SOLO_STUDIO_TRUST_PROXY_HEADERS=1 \
     -e SOLO_STUDIO_TRUSTED_PROXY_NETWORKS=127.0.0.1/32,::1/128 \
@@ -83,13 +232,17 @@ run_container() {
 run_container_preflight() {
   local image_tag="$1"
   local container_name="${2:-${APP_NAME}-rollback-preflight}"
-  docker run -d \
+  run_tracked docker run -d \
     --name "$container_name" \
     --network none \
+    "${DOCKER_RESOURCE_ARGS[@]}" \
+    "${CONTAINER_USER_ARGS[@]}" \
     -e SOLO_STUDIO_API_TOKEN \
     -e SOLO_STUDIO_JOBS_FILE=/app/state/jobs.json \
+    -e SOLO_STUDIO_DATABASE_FILE=/app/state/solo_studio.sqlite3 \
     -e SOLO_STUDIO_REQUIRE_API_TOKEN=1 \
-    -e SOLO_STUDIO_DISABLE_WORKER=1 \
+    -e SOLO_STUDIO_EXPECTED_RUNTIME_UID="$runtime_uid" \
+    -e SOLO_STUDIO_EXPECTED_RUNTIME_GID="$runtime_gid" \
     -e SOLO_STUDIO_TRUST_PROXY_HEADERS=1 \
     -e SOLO_STUDIO_TRUSTED_PROXY_NETWORKS=127.0.0.1/32,::1/128 \
     -e SOLO_STUDIO_SESSION_COOKIE_PATH=/video \
@@ -98,13 +251,97 @@ run_container_preflight() {
     -e SOLO_STUDIO_HIGGSFIELD_MODEL="$SOLO_STUDIO_HIGGSFIELD_MODEL" \
     -e SOLO_STUDIO_HIGGSFIELD_RESOLUTION="$SOLO_STUDIO_HIGGSFIELD_RESOLUTION" \
     -e SOLO_STUDIO_HIGGSFIELD_TIMEOUT="$SOLO_STUDIO_HIGGSFIELD_TIMEOUT" \
+    -v "${PREFLIGHT_OUTPUT_DIR:-$APP_DIR/output}:/app/output" \
+    -v "${PREFLIGHT_STATE_DIR:-$APP_DIR/state}:/app/state" \
+    "${HIGGSFIELD_CREDENTIALS_MOUNT[@]}" \
     "$image_tag"
+}
+
+preflight_image() {
+  local image_tag="$1"
+  local preflight_label="$2"
+  local preflight_name="${APP_NAME}-${preflight_label}-preflight-$$"
+  local start_status=0
+  local healthy=0
+
+  # Reconcile a stale preflight before creating new bind-mount directories.  An
+  # unknown Docker state is fail-closed and leaves any existing state untouched.
+  PREFLIGHT_DIRS_SAFE_TO_DELETE=0
+  if ! remove_container_and_verify "$preflight_name"; then
+    echo "Refusing to start isolated preflight while the prior preflight container state is unknown." >&2
+    return 1
+  fi
+
+  PREFLIGHT_STATE_DIR=$(mktemp -d)
+  PREFLIGHT_OUTPUT_DIR=$(mktemp -d)
+  chmod 0700 "$PREFLIGHT_STATE_DIR" "$PREFLIGHT_OUTPUT_DIR"
+  chown "$runtime_uid:$runtime_gid" "$PREFLIGHT_STATE_DIR" "$PREFLIGHT_OUTPUT_DIR"
+  printf '{}\n' > "$PREFLIGHT_STATE_DIR/jobs.json"
+  chmod 0600 "$PREFLIGHT_STATE_DIR/jobs.json"
+  chown "$runtime_uid:$runtime_gid" "$PREFLIGHT_STATE_DIR/jobs.json"
+
+  if run_container_preflight "$image_tag" "$preflight_name" >/dev/null; then
+    :
+  else
+    start_status=$?
+  fi
+  if [ "$start_status" -ne 0 ]; then
+    # A failed docker run may still have created a container.  Reconcile it
+    # before cleanup; never exec against it and never remove its mounts while
+    # Docker's absence check is ambiguous.
+    PREFLIGHT_DIRS_SAFE_TO_DELETE=0
+    if ! remove_container_and_verify "$preflight_name"; then
+      echo "Preflight startup failed and container removal was not verified; preserving temporary bind-mount directories." >&2
+      return 1
+    fi
+    PREFLIGHT_DIRS_SAFE_TO_DELETE=1
+    clear_preflight_dirs
+    echo "Release image could not start in isolated preflight." >&2
+    return 1
+  fi
+
+  # Keep every runtime check in one docker exec while the preflight container
+  # is alive.  Removal and mount cleanup happen only after this loop finishes.
+  for attempt in $(seq 1 20); do
+    if run_tracked docker exec "$preflight_name" sh -ceu '
+      test "$(id -u)" = "$SOLO_STUDIO_EXPECTED_RUNTIME_UID"
+      test "$(id -g)" = "$SOLO_STUDIO_EXPECTED_RUNTIME_GID"
+      test -w /app/state && test -w /app/output
+      python -c "import api, job_store, worker"
+      test "$(curl -sS --max-time 3 -o /dev/null -w "%{http_code}" http://127.0.0.1:9091/api/health)" = "200"
+      test "$(curl -sS --max-time 3 -o /dev/null -w "%{http_code}" http://127.0.0.1:9091/api/templates)" = "200"
+      test "$(curl -sS --max-time 3 -o /dev/null -w "%{http_code}" http://127.0.0.1:9091/api/jobs?limit=1)" = "401"
+      test "$(curl -sS --max-time 3 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $SOLO_STUDIO_API_TOKEN" http://127.0.0.1:9091/api/jobs?limit=1)" = "200"
+    '; then
+      healthy=1
+      break
+    fi
+    sleep 1
+  done
+
+  # The container is still alive through the final exec above.  Reconcile
+  # removal before permitting cleanup of either bind-mount directory.
+  PREFLIGHT_DIRS_SAFE_TO_DELETE=0
+  if ! remove_container_and_verify "$preflight_name"; then
+    echo "Preflight container removal was not verified; preserving temporary bind-mount directories." >&2
+    return 1
+  fi
+  PREFLIGHT_DIRS_SAFE_TO_DELETE=1
+  clear_preflight_dirs
+  if [ "$healthy" != "1" ]; then
+    echo "Release image failed isolated UID/GID, mount, import, or route preflight." >&2
+    return 1
+  fi
+  echo "${preflight_label^^}_IMAGE_PREFLIGHT_OK image=$image_tag"
+}
+
+preflight_release_image() {
+  preflight_image "$release_tag" release
 }
 
 wait_for_local_health() {
   for attempt in $(seq 1 20); do
-    if curl "${CURL_BOUNDED[@]}" -fsS http://127.0.0.1:9091/api/health >/dev/null \
-      && curl "${CURL_BOUNDED[@]}" -fsS http://127.0.0.1:9091/video/api/health >/dev/null; then
+    if curl "${CURL_BOUNDED[@]}" -fsS http://127.0.0.1:9091/api/health >/dev/null; then
       echo "LOCAL_HEALTH_OK attempt=$attempt"
       return 0
     fi
@@ -134,36 +371,45 @@ wait_for_public_health() {
 }
 
 preflight_rollback_image() {
-  local preflight_name="${APP_NAME}-rollback-preflight-$$"
-  docker rm -f "$preflight_name" >/dev/null 2>&1 || true
-  if ! run_container_preflight "$rollback_tag" "$preflight_name" >/dev/null; then
-    docker rm -f "$preflight_name" >/dev/null 2>&1 || true
-    return 1
-  fi
-  local healthy=0
-  for attempt in $(seq 1 20); do
-    if docker exec "$preflight_name" curl -fsS --max-time 3 http://127.0.0.1:9091/api/health >/dev/null \
-      && docker exec "$preflight_name" curl -fsS --max-time 3 http://127.0.0.1:9091/video/api/health >/dev/null; then
-      healthy=1
-      break
-    fi
-    sleep 1
-  done
-  docker rm -f "$preflight_name" >/dev/null 2>&1 || true
-  if [ "$healthy" != "1" ]; then
-    echo "Rollback image failed isolated local health preflight." >&2
-    return 1
-  fi
+  preflight_image "$rollback_tag" rollback
 }
 
 rollback_live() {
-  local status=$?
+  local status="${1:-$?}"
+  local inspect_status=0
+  local fallback_status=0
   if [ "$status" -eq 0 ]; then
     return 0
   fi
   echo ""
   echo "=== Deploy failed; attempting rollback ===" >&2
-  if [ "$container_replaced" != "1" ]; then
+  if [ "$replacement_started" = "1" ] && [ "$container_replaced" != "1" ]; then
+    if reconcile_replacement; then
+      :
+    else
+      inspect_status=$?
+      if [ "$inspect_status" -eq 2 ]; then
+        echo "Replacement container existence is uncertain; refusing rollback mutation." >&2
+        exit "$status"
+      fi
+    fi
+  fi
+  if [ "$removal_started" = "1" ] && [ "$removal_confirmed" != "1" ]; then
+    if container_inspect_state "$APP_NAME"; then
+      echo "Container removal outcome is uncertain because the existing container is still present; refusing rollback mutation." >&2
+      exit "$status"
+    else
+      inspect_status=$?
+    fi
+    case "$inspect_status" in
+      1) removal_confirmed=1 ;;
+      *)
+        echo "Container removal outcome is uncertain because Docker inspect failed without confirming absence; refusing rollback mutation." >&2
+        exit "$status"
+        ;;
+    esac
+  fi
+  if [ "$container_replaced" != "1" ] && [ "$removal_confirmed" != "1" ]; then
     echo "Container was not replaced yet; leaving existing service untouched." >&2
     exit "$status"
   fi
@@ -175,14 +421,24 @@ rollback_live() {
     echo "Rollback preflight failed; refusing to remove the current container." >&2
     exit "$status"
   fi
-  docker rm -f "$APP_NAME" >/dev/null 2>&1 || true
-  if ! run_container "$rollback_tag" >/dev/null; then
-    echo "Rollback container could not be started from $rollback_tag." >&2
+  if ! remove_container_and_verify "$APP_NAME"; then
+    echo "Rollback could not verify removal of the replacement container; refusing to start a fallback container." >&2
+    exit "$status"
+  fi
+  removal_confirmed=1
+  if start_container_and_reconcile "$rollback_tag"; then
+    :
+  else
+    fallback_status=$?
+    if [ "$fallback_status" -eq 2 ]; then
+      echo "Rollback container existence is uncertain; refusing further mutation." >&2
+    else
+      echo "Rollback container could not be started from $rollback_tag." >&2
+    fi
     exit "$status"
   fi
   for attempt in $(seq 1 20); do
     if curl "${CURL_BOUNDED[@]}" -fsS http://127.0.0.1:9091/api/health >/dev/null \
-      && curl "${CURL_BOUNDED[@]}" -fsS http://127.0.0.1:9091/video/api/health >/dev/null \
       && curl "${CURL_BOUNDED[@]}" -fsS "$DOMAIN/api/health" >/dev/null \
       && [ "$(curl "${CURL_BOUNDED[@]}" -sS -o /dev/null -w '%{http_code}' "$PUBLIC_JOBS_URL")" = "401" ] \
       && curl "${CURL_BOUNDED[@]}" -fsS --config "$curl_config" "$PUBLIC_JOBS_URL" >/dev/null; then
@@ -195,16 +451,49 @@ rollback_live() {
   exit "$status"
 }
 
+rollback_signal() {
+  local status=$?
+  [ "$status" -eq 0 ] && status=1
+  if [ -n "$active_child_pid" ]; then
+    kill -TERM "$active_child_pid" >/dev/null 2>&1 || true
+    wait "$active_child_pid" >/dev/null 2>&1 || true
+    active_child_pid=""
+  fi
+  rollback_live "$status"
+}
+
 trap cleanup EXIT
 trap rollback_live ERR
+trap rollback_signal HUP INT TERM
 
 echo "=== Building Solo Studio Video ==="
+if [ -L "$APP_DIR" ] || [ ! -d "$APP_DIR" ]; then
+  echo "Application directory must be a real directory before build." >&2
+  exit 1
+fi
 cd "$APP_DIR"
 timestamp=$(date -u +%Y%m%d%H%M%S%N)-$$
 release_tag="solo-studio-video:release-$timestamp"
 rollback_tag="solo-studio-video:rollback-$timestamp"
 
-current_image=$(docker inspect -f '{{.Image}}' "$APP_NAME" 2>/dev/null || true)
+current_image=""
+current_container_state=0
+if container_inspect_state "$APP_NAME"; then
+  existing_container_found=1
+  if ! current_image=$(docker inspect -f '{{.Image}}' "$APP_NAME" 2>/dev/null); then
+    echo "Docker reported the existing container but could not inspect its image; refusing deployment." >&2
+    exit 1
+  fi
+else
+  current_container_state=$?
+  case "$current_container_state" in
+    1) ;;
+    *)
+      echo "Could not determine whether $APP_NAME exists because Docker inspect failed; refusing deployment." >&2
+      exit 1
+      ;;
+  esac
+fi
 if [ -z "$current_image" ] && docker image inspect "$APP_NAME:latest" >/dev/null 2>&1; then
   current_image="$APP_NAME:latest"
 fi
@@ -216,19 +505,94 @@ else
   echo "No existing $APP_NAME container found; rollback image not created."
 fi
 
-docker build -t "$release_tag" .
-docker tag "$release_tag" "$APP_NAME:latest"
+run_tracked docker build -t "$release_tag" .
+run_tracked docker tag "$release_tag" "$APP_NAME:latest"
 
 # Ensure shared state file exists with correct host/container permissions.
+if [ -L "$APP_DIR" ] || [ ! -d "$APP_DIR" ]; then
+  echo "Application directory must be a real directory." >&2
+  exit 1
+fi
+for shared_dir in "$APP_DIR/state" "$APP_DIR/output"; do
+  if [ -L "$shared_dir" ] || { [ -e "$shared_dir" ] && [ ! -d "$shared_dir" ]; }; then
+    echo "Refusing symlinked or non-directory bind-mount path: $shared_dir" >&2
+    exit 1
+  fi
+done
 mkdir -p "$APP_DIR/state"
+mkdir -p "$APP_DIR/output"
+if [ -L "$APP_DIR/state/jobs.json" ]; then
+  echo "Refusing symlinked state/jobs.json; repair the state directory before deployment." >&2
+  exit 1
+fi
 if [ ! -e "$APP_DIR/state/jobs.json" ]; then
-  if [ -f "$APP_DIR/jobs.json" ]; then
-    cp -p "$APP_DIR/jobs.json" "$APP_DIR/state/jobs.json"
+  if [ -L "$APP_DIR/jobs.json" ]; then
+    echo "Refusing symlinked legacy jobs.json migration source." >&2
+    exit 1
+  elif [ -f "$APP_DIR/jobs.json" ]; then
+    python3 -c '
+import os, shutil, sys
+source_fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    target_fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o660)
+    try:
+        with os.fdopen(source_fd, "rb", closefd=False) as source, os.fdopen(target_fd, "wb", closefd=False) as target:
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+    finally:
+        os.close(target_fd)
+finally:
+    os.close(source_fd)
+' "$APP_DIR/jobs.json" "$APP_DIR/state/jobs.json"
+  elif [ -e "$APP_DIR/jobs.json" ]; then
+    echo "Refusing non-regular legacy jobs.json migration source." >&2
+    exit 1
   else
-    touch "$APP_DIR/state/jobs.json"
+    printf '{}\n' > "$APP_DIR/state/jobs.json"
   fi
 fi
 chmod 660 "$APP_DIR/state/jobs.json"
+if [ "$(id -u)" = "0" ]; then
+  chown -R 10001:10001 "$APP_DIR/state" "$APP_DIR/output"
+  CONTAINER_USER_ARGS=(--user 10001:10001)
+  runtime_uid=10001
+  runtime_gid=10001
+else
+  CONTAINER_USER_ARGS=(--user "$(id -u):$(id -g)")
+  runtime_uid=$(id -u)
+  runtime_gid=$(id -g)
+  if [ ! -w "$APP_DIR/state" ] || [ ! -w "$APP_DIR/output" ]; then
+    echo "Current host identity $(id -u):$(id -g) cannot write the state/output bind mounts." >&2
+    exit 1
+  fi
+fi
+
+if [ "$SOLO_STUDIO_ENABLE_HIGGSFIELD" = "1" ]; then
+  if ! run_tracked docker run --rm --network none --user "$runtime_uid:$runtime_gid" \
+    -v "$HIGGSFIELD_CREDENTIALS_FILE:/mnt/higgsfield-credentials:ro" \
+    "$release_tag" sh -ceu 'test -r /mnt/higgsfield-credentials'; then
+    echo "Higgsfield credentials are not readable by the selected container UID/GID." >&2
+    exit 1
+  fi
+fi
+
+if ! run_tracked docker run --rm --network none --user "$runtime_uid:$runtime_gid" \
+  -v "$APP_DIR/state:/mnt/state" \
+  -v "$APP_DIR/output:/mnt/output" \
+  "$release_tag" sh -ceu '
+    test -w /mnt/state && test -w /mnt/output
+    for path in /mnt/state/jobs.json /mnt/state/solo_studio.sqlite3 /mnt/state/solo_studio.sqlite3-wal /mnt/state/solo_studio.sqlite3-shm; do
+      if [ -e "$path" ] && [ ! -w "$path" ]; then exit 1; fi
+    done
+    touch /mnt/state/.solo-studio-write-test /mnt/output/.solo-studio-write-test
+    rm -f /mnt/state/.solo-studio-write-test /mnt/output/.solo-studio-write-test
+  '; then
+  echo "State/output bind mounts are not writable by the selected container UID/GID." >&2
+  exit 1
+fi
+
+preflight_release_image
 
 curl_config=$(mktemp)
 chmod 600 "$curl_config"
@@ -237,16 +601,43 @@ printf '%s\n' "header = \"Authorization: Bearer $SOLO_STUDIO_API_TOKEN\"" > "$cu
 echo ""
 echo "=== Deploying on edgescout.tech/video ==="
 container_replaced=0
-if docker inspect "$APP_NAME" >/dev/null 2>&1; then
-  docker rm -f "$APP_NAME"
-  container_replaced=1
+removal_started=0
+removal_confirmed=0
+replacement_started=0
+if container_inspect_state "$APP_NAME"; then
+  if ! curl "${CURL_BOUNDED[@]}" -fsS --config "$curl_config" "$PUBLIC_JOBS_URL" >/dev/null; then
+    echo "Existing container failed the authenticated protected-route preflight; refusing replacement." >&2
+    exit 1
+  fi
+  removal_started=1
+  if ! remove_container_and_verify "$APP_NAME"; then
+    echo "Existing container removal was not verified; refusing replacement." >&2
+    exit 1
+  fi
+  removal_confirmed=1
+else
+  current_container_state=$?
+  case "$current_container_state" in
+    1) ;;
+    *)
+      echo "Could not determine whether $APP_NAME exists before replacement; refusing deployment." >&2
+      exit 1
+      ;;
+  esac
 fi
-if [ "$container_replaced" != "1" ] && [ -n "$current_image" ]; then
+if [ "$existing_container_found" = "1" ] && [ "$removal_confirmed" != "1" ]; then
   echo "Existing container could not be removed; refusing replacement." >&2
   exit 1
 fi
-container_replaced=1
-run_container "$release_tag" >/dev/null
+start_status=0
+if start_container_and_reconcile "$release_tag"; then
+  :
+else
+  start_status=$?
+fi
+if [ "$start_status" -ne 0 ]; then
+  rollback_live 1
+fi
 
 echo ""
 echo "Waiting for container to start..."
@@ -260,7 +651,7 @@ echo ""
 echo "=== Local smoke test ==="
 wait_for_local_health
 curl "${CURL_BOUNDED[@]}" -fsS http://127.0.0.1:9091/api/health
-curl "${CURL_BOUNDED[@]}" -fsS http://127.0.0.1:9091/video/api/health
+curl "${CURL_BOUNDED[@]}" -fsS "$DOMAIN/api/health"
 
 echo ""
 echo "=== Public Traefik smoke test ==="

@@ -6,11 +6,12 @@ Output: captions.srt + assembly_manifest.json
 """
 import json, sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from package_utils import atomic_write_json, atomic_write_text, read_json_artifact
 
 
 def load_storyboard(path: str) -> dict:
-    with open(path) as f:
-        return json.load(f)
+    return read_json_artifact(path)
 
 
 def generate_captions_srt(storyboard: dict) -> str:
@@ -140,14 +141,12 @@ def main():
     # Generate captions
     srt = generate_captions_srt(storyboard)
     captions_path = output_dir / "captions.srt"
-    with open(captions_path, 'w') as f:
-        f.write(srt)
+    atomic_write_text(captions_path, srt)
 
     # Generate assembly manifest
     manifest = generate_assembly_manifest(storyboard)
     manifest_path = output_dir / "assembly_manifest.json"
-    with open(manifest_path, 'w') as f:
-        json.dump(manifest, f, indent=2)
+    atomic_write_json(manifest_path, manifest)
 
     caption_count = srt.count("-->")
     print(f"Captions: {captions_path} ({caption_count} entries)")

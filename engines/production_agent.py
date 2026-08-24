@@ -6,16 +6,16 @@ Output: audio/voiceover.mp3 + video_prompts.json + music_prompt.txt
 """
 import json, sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from package_utils import atomic_write_json, atomic_write_text, read_json_artifact, read_text_artifact
 
 
 def load_storyboard(path: str) -> dict:
-    with open(path) as f:
-        return json.load(f)
+    return read_json_artifact(path)
 
 
 def load_script(path: str) -> str:
-    with open(path) as f:
-        return f.read()
+    return read_text_artifact(path)
 
 
 def generate_video_prompts(storyboard: dict, visual_style: str = "") -> list[dict]:
@@ -102,29 +102,25 @@ def main():
     tone = 'professional'
     visual_style = ''
     if brief_path.exists():
-        with open(brief_path) as f:
-            brief = json.load(f)
-            tone = brief.get('tone', 'professional')
-            visual_style = brief.get('visual_style', '')
+        brief = read_json_artifact(brief_path)
+        tone = brief.get('tone', 'professional')
+        visual_style = brief.get('visual_style', '')
 
     # Generate video prompts
     video_prompts = generate_video_prompts(storyboard, visual_style)
     vp_path = output_dir / "video_prompts.json"
-    with open(vp_path, 'w') as f:
-        json.dump({'scenes': video_prompts, 'total_scenes': len(video_prompts)}, f, indent=2)
+    atomic_write_json(vp_path, {'scenes': video_prompts, 'total_scenes': len(video_prompts)})
 
     # Generate music prompt
     music_prompt = generate_music_prompt(storyboard, tone)
     music_path = output_dir / "music_prompt.txt"
-    with open(music_path, 'w') as f:
-        f.write(music_prompt)
+    atomic_write_text(music_path, music_prompt)
 
     # Generate voiceover text
     vo_text = build_voiceover_text(storyboard)
     vo_text_path = output_dir / "audio" / "voiceover_script.txt"
     vo_text_path.parent.mkdir(exist_ok=True)
-    with open(vo_text_path, 'w') as f:
-        f.write(vo_text)
+    atomic_write_text(vo_text_path, vo_text)
 
     print(f"Video prompts: {vp_path} ({len(video_prompts)} scenes)")
     print(f"Music prompt: {music_path}")

@@ -11,6 +11,10 @@ output/*/
 # Jobs state
 jobs.json
 jobs.json.lock
+state/*.sqlite3
+state/*.sqlite3-*
+state/*.sqlite3.*
+state/*.json.lock
 .solo_studio_api_token
 
 # IDE

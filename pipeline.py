@@ -19,7 +19,7 @@ Usage:
 import argparse, json, subprocess, sys
 from pathlib import Path
 
-from package_utils import clear_generated_artifacts, write_package_manifest
+from package_utils import atomic_write_json, clear_generated_artifacts, read_json_artifact, write_package_manifest
 
 ENGINES = Path(__file__).resolve().parent / "engines"
 
@@ -156,13 +156,11 @@ def _fail_pipeline(out: Path, brief_path: Path, error: str):
 def _generate_thumbnail_prompt(out: Path, brief_json: Path):
     """Generate a YouTube thumbnail prompt."""
     try:
-        with open(brief_json) as f:
-            brief = json.load(f)
+        brief = read_json_artifact(brief_json)
         sb_path = out / "storyboard.json"
         if not sb_path.exists():
             return
-        with open(sb_path) as f:
-            sb = json.load(f)
+        sb = read_json_artifact(sb_path)
 
         topic = brief.get('topic', '')
         tone = brief.get('tone', 'professional')
@@ -181,8 +179,7 @@ def _generate_thumbnail_prompt(out: Path, brief_json: Path):
             f"High contrast, vibrant, 4K, 16:9. Maximum 4 words. Clickable."
         )
         tp = out / "thumbnail_prompt.json"
-        with open(tp, 'w') as f:
-            json.dump({'title_overlay': overlay, 'prompt': prompt, 'filename': 'youtube_thumbnail.png'}, f, indent=2)
+        atomic_write_json(tp, {'title_overlay': overlay, 'prompt': prompt, 'filename': 'youtube_thumbnail.png'})
         print(f"  Thumbnail prompt: {tp}")
     except Exception as e:
         print(f"  ⚠ Thumbnail prompt failed: {e}")
