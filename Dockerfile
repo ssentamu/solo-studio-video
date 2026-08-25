@@ -76,7 +76,8 @@ RUN mkdir -p /tmp/nginx-client /tmp/nginx-proxy /tmp/nginx-fastcgi /tmp/nginx-uw
             proxy_set_header X-Forwarded-Proto $scheme; \
         } \
     }' > /etc/nginx/conf.d/default.conf && \
-    nginx -t -c /etc/nginx/nginx.conf
+    nginx -t -c /etc/nginx/nginx.conf && \
+    rm -f /tmp/nginx.pid
 
 # Start script — fail the container if any critical process exits.
 RUN printf '%s\n' \
