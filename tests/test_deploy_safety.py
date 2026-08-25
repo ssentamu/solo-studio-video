@@ -120,6 +120,17 @@ class DeploymentSafetyTests(unittest.TestCase):
             rollback.index("start_container_and_reconcile \"$rollback_tag\""),
         )
 
+    def test_public_health_uses_bounded_retry_before_direct_public_request(self):
+        local_smoke = self.deploy.index('echo "=== Local smoke test ==="')
+        public_smoke = self.deploy.index('echo "=== Public Traefik smoke test ==="')
+        local_block = self.deploy[local_smoke:public_smoke]
+        public_block = self.deploy[public_smoke:]
+        self.assertNotIn('curl "${CURL_BOUNDED[@]}" -fsS "$DOMAIN/api/health"', local_block)
+        self.assertLess(
+            public_block.index("wait_for_public_health"),
+            public_block.index('curl "${CURL_BOUNDED[@]}" -fsS "$DOMAIN/api/health"'),
+        )
+
     def run_preflight_fake_docker(
         self, mode, state_jobs=None, state_jobs_symlink=False, state_database=False
     ):

@@ -772,11 +772,11 @@ echo ""
 echo "=== Local smoke test ==="
 wait_for_local_health
 curl "${CURL_BOUNDED[@]}" -fsS http://127.0.0.1:9091/api/health
-curl "${CURL_BOUNDED[@]}" -fsS "$DOMAIN/api/health"
 
 echo ""
 echo "=== Public Traefik smoke test ==="
 wait_for_public_health
+curl "${CURL_BOUNDED[@]}" -fsS "$DOMAIN/api/health"
 
 curl "${CURL_BOUNDED[@]}" -sSI "$DOMAIN/" 2>&1 | head -5
 curl "${CURL_BOUNDED[@]}" -fsS "$DOMAIN/api/health" 2>&1
