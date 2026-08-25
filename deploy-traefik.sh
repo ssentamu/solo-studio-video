@@ -100,7 +100,7 @@ container_inspect_state() {
   local container_name="$1"
   local inspect_error=""
   local inspect_status=0
-  if inspect_error=$(docker inspect "$container_name" 2>&1 >/dev/null); then
+  if inspect_error=$(docker container inspect "$container_name" 2>&1 >/dev/null); then
     return 0
   else
     inspect_status=$?
@@ -480,7 +480,7 @@ current_image=""
 current_container_state=0
 if container_inspect_state "$APP_NAME"; then
   existing_container_found=1
-  if ! current_image=$(docker inspect -f '{{.Image}}' "$APP_NAME" 2>/dev/null); then
+  if ! current_image=$(docker container inspect -f '{{.Image}}' "$APP_NAME" 2>/dev/null); then
     echo "Docker reported the existing container but could not inspect its image; refusing deployment." >&2
     exit 1
   fi

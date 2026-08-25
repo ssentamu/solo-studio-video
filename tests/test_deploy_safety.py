@@ -88,6 +88,8 @@ class DeploymentSafetyTests(unittest.TestCase):
 
     def test_deployment_removals_are_verified_and_unknown_inspect_fails_closed(self):
         self.assertEqual(self.deploy.count('docker rm -f'), 1)
+        self.assertIn('docker container inspect "$container_name"', self.deploy)
+        self.assertIn("docker container inspect -f '{{.Image}}'", self.deploy)
         self.assertIn('grep -Eiq "No such (object|container)"', self.deploy)
         self.assertIn("return 2", self.deploy)
         remove_start = self.deploy.index("remove_container_and_verify()")
@@ -131,6 +133,7 @@ class DeploymentSafetyTests(unittest.TestCase):
                 f"state={container_state!s}\n"
                 f"mode={mode!s}\n"
                 "command=${1:-}\n"
+                "if [ \"$command\" = container ]; then command=${2:-}; fi\n"
                 "case \"$command\" in\n"
                 "  run)\n"
                 "    printf '%s\\n' RUN >> \"$log\"\n"
