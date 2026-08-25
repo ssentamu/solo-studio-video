@@ -1267,6 +1267,8 @@ def _validate_legacy_record(key: Any, payload: Any) -> dict[str, Any]:
     if idempotency is not None and idempotency.strip() != idempotency:
         raise InvalidStoreState("legacy idempotency_key must be canonical")
     stage_value = payload.get("stage_names", DEFAULT_STAGE_NAMES)
+    if stage_value is None:
+        stage_value = DEFAULT_STAGE_NAMES
     if not isinstance(stage_value, (list, tuple)):
         raise InvalidStoreState("legacy stage_names must be a list of strings")
     stages = _validate_stage_names(stage_value)
@@ -1284,7 +1286,8 @@ def _validate_legacy_record(key: Any, payload: Any) -> dict[str, Any]:
     current_stage = payload.get("stage", stages[0])
     if current_stage == "waiting":
         current_stage = stages[0]
-    if not isinstance(current_stage, str) or current_stage not in stages:
+    legacy_completed_stage = imported_status == "completed" and current_stage == "done"
+    if not isinstance(current_stage, str) or (current_stage not in stages and not legacy_completed_stage):
         raise InvalidStoreState("legacy current stage is invalid")
     completed_at = _validate_legacy_timestamp(payload.get("completed_at"), "completed_at") if payload.get("completed_at") is not None else None
     cancelled_at = _validate_legacy_timestamp(payload.get("cancelled_at"), "cancelled_at") if payload.get("cancelled_at") is not None else None

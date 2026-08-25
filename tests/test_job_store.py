@@ -262,6 +262,24 @@ class JobStoreTests(unittest.TestCase):
             job_store.import_jobs_json_once(source, path=self.db)
         self.assertEqual(job_store.get_job("legacy", self.db)["topic"], "old")
 
+    def test_import_accepts_historical_completed_done_stage(self):
+        source = Path(self.tmp.name) / "jobs.json"
+        source.write_text(json.dumps({
+            "legacy-completed": {
+                "id": "legacy-completed",
+                "status": "completed",
+                "stage": "done",
+                "stage_names": None,
+            },
+        }))
+
+        self.assertEqual(job_store.import_jobs_json_once(source, path=self.db), 1)
+        imported = job_store.get_job("legacy-completed", self.db)
+        if imported is None:
+            self.fail("legacy completed job was not imported")
+        self.assertEqual(imported["status"], "completed")
+        self.assertEqual(imported["stage"], "done")
+
     def test_import_rejects_invalid_max_retries(self):
         source = Path(self.tmp.name) / "jobs.json"
         source.write_text(json.dumps({"legacy": {"id": "legacy", "max_retries": 21}}))
