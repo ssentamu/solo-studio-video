@@ -110,6 +110,8 @@ class DeploymentSafetyTests(unittest.TestCase):
         self.assertIn("Replacement container existence could not be reconciled", self.deploy)
         self.assertIn("refusing rollback mutation", self.deploy)
         self.assertNotIn('if docker inspect "$APP_NAME" >/dev/null 2>&1; then', self.deploy)
+        self.assertIn("docker container inspect -f '{{.State.Status}}' \"$APP_NAME\"", self.deploy)
+        self.assertIn("restarting|exited|created|dead|paused)", self.deploy)
         rollback_start = self.deploy.index("rollback_live()")
         rollback_end = self.deploy.index("rollback_signal()")
         rollback = self.deploy[rollback_start:rollback_end]

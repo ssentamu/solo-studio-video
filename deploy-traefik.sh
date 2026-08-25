@@ -708,11 +708,28 @@ container_replaced=0
 removal_started=0
 removal_confirmed=0
 replacement_started=0
+existing_container_status=""
 if container_inspect_state "$APP_NAME"; then
-  if ! curl "${CURL_BOUNDED[@]}" -fsS --config "$curl_config" "$PUBLIC_JOBS_URL" >/dev/null; then
-    echo "Existing container failed the authenticated protected-route preflight; refusing replacement." >&2
+  existing_container_found=1
+  if ! existing_container_status=$(docker container inspect -f '{{.State.Status}}' "$APP_NAME" 2>/dev/null); then
+    echo "Docker reported the existing container but could not inspect its runtime status; refusing deployment." >&2
     exit 1
   fi
+  case "$existing_container_status" in
+    running)
+      if ! curl "${CURL_BOUNDED[@]}" -fsS --config "$curl_config" "$PUBLIC_JOBS_URL" >/dev/null; then
+        echo "Existing running container failed the authenticated protected-route preflight; refusing replacement." >&2
+        exit 1
+      fi
+      ;;
+    restarting|exited|created|dead|paused)
+      echo "Existing container is unavailable (status=$existing_container_status); replacing only after release preflight." >&2
+      ;;
+    *)
+      echo "Existing container has an unrecognized runtime status ($existing_container_status); refusing deployment." >&2
+      exit 1
+      ;;
+  esac
   removal_started=1
   if ! remove_container_and_verify "$APP_NAME"; then
     echo "Existing container removal was not verified; refusing replacement." >&2
