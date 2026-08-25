@@ -1,6 +1,7 @@
 import fnmatch
 import os
 import re
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -117,7 +118,9 @@ class DeploymentSafetyTests(unittest.TestCase):
             rollback.index("start_container_and_reconcile \"$rollback_tag\""),
         )
 
-    def run_preflight_fake_docker(self, mode):
+    def run_preflight_fake_docker(
+        self, mode, state_jobs=None, state_jobs_symlink=False, state_database=False
+    ):
         """Run the real preflight function against a deterministic fake Docker."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -179,6 +182,26 @@ class DeploymentSafetyTests(unittest.TestCase):
             )
             fake_rm.chmod(0o755)
 
+            app_dir_setup = ""
+            if state_jobs is not None or state_jobs_symlink:
+                app_dir = root / "appdir"
+                (app_dir / "state").mkdir(parents=True)
+                jobs_path = app_dir / "state" / "jobs.json"
+                if state_jobs_symlink:
+                    real_target = root / "real-jobs.json"
+                    real_target.write_text("{}")
+                    jobs_path.symlink_to(real_target)
+                else:
+                    jobs_path.write_text(state_jobs)
+                app_dir_setup = f"APP_DIR={app_dir}\n"
+            elif state_database:
+                app_dir = root / "appdir"
+                (app_dir / "state").mkdir(parents=True)
+                with sqlite3.connect(app_dir / "state" / "solo_studio.sqlite3") as database:
+                    database.execute("CREATE TABLE marker (value TEXT)")
+                    database.execute("INSERT INTO marker VALUES ('real-db')")
+                app_dir_setup = f"APP_DIR={app_dir}\n"
+
             start = self.deploy.index("#!/bin/bash")
             function_source = self.deploy[start:self.deploy.index("preflight_release_image() {")]
             harness = (
@@ -189,6 +212,7 @@ class DeploymentSafetyTests(unittest.TestCase):
                 + "runtime_uid=$(id -u)\n"
                 + "runtime_gid=$(id -g)\n"
                 + "CONTAINER_USER_ARGS=()\n"
+                + app_dir_setup
                 + "if preflight_image test-image release; then result=0; else result=$?; fi\n"
                 + "printf 'RESULT=%s\\nSTATE=%s\\nOUTPUT=%s\\n' \"$result\" \"$PREFLIGHT_STATE_DIR\" \"$PREFLIGHT_OUTPUT_DIR\"\n"
             )
@@ -235,6 +259,72 @@ class DeploymentSafetyTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, output)
         self.assertIn("RESULT=0", output)
         self.assertLess(events.index("EXEC"), events.index("RM", events.index("RUN")))
+
+    def test_preflight_state_seed_copies_real_legacy_jobs_file(self):
+        sentinel = '{"job-1": {"id": "job-1"}}'
+        completed, events, output = self.run_preflight_fake_docker(
+            "ambiguous", state_jobs=sentinel
+        )
+
+        self.assertEqual(completed.returncode, 0, output)
+        self.assertIn("RESULT=1", output)
+        self.assertIn("RUN", events)
+        state_line = next(line for line in output.splitlines() if line.startswith("STATE="))
+        seeded = Path(state_line.removeprefix("STATE=")) / "jobs.json"
+        self.assertEqual(seeded.read_text(), sentinel)
+
+    def test_preflight_refuses_symlinked_state_jobs_seed(self):
+        completed, events, output = self.run_preflight_fake_docker(
+            "success", state_jobs_symlink=True
+        )
+
+        self.assertEqual(completed.returncode, 0, output)
+        self.assertIn("RESULT=1", output)
+        self.assertNotIn("RUN", events)
+        self.assertIn("Refusing symlinked or non-regular state/jobs.json", output)
+
+    def test_preflight_seed_copy_is_nofollow_and_exclusive(self):
+        self.assertIn(
+            'copy_regular_file_excl "$APP_DIR/state/jobs.json" "$PREFLIGHT_STATE_DIR/jobs.json" 600',
+            self.deploy,
+        )
+        self.assertIn("O_NOFOLLOW", self.deploy)
+        self.assertIn("O_NONBLOCK", self.deploy)
+        self.assertIn("os.link(temp_path, sys.argv[2], follow_symlinks=False)", self.deploy)
+        self.assertIn("stat.S_ISREG(os.fstat(source_fd).st_mode)", self.deploy)
+        self.assertIn("copy_sqlite_database_excl", self.deploy)
+
+    def test_preflight_state_seed_copies_real_sqlite_database(self):
+        completed, events, output = self.run_preflight_fake_docker(
+            "ambiguous", state_database=True
+        )
+
+        self.assertEqual(completed.returncode, 0, output)
+        self.assertIn("RESULT=1", output)
+        state_line = next(line for line in output.splitlines() if line.startswith("STATE="))
+        seeded = Path(state_line.removeprefix("STATE=")) / "solo_studio.sqlite3"
+        with sqlite3.connect(seeded) as database:
+            self.assertEqual(database.execute("SELECT value FROM marker").fetchone(), ("real-db",))
+
+    def test_preflight_rejects_fifo_state_jobs_without_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs_path = root / "jobs.json"
+            os.mkfifo(jobs_path)
+            source = self.deploy.index("#!/bin/bash")
+            helper = self.deploy[source:self.deploy.index("container_inspect_state()")]
+            harness = (
+                helper
+                + f"copy_regular_file_excl {jobs_path} {root / 'copy.json'} 600"
+            )
+            completed = subprocess.run(
+                ["bash", "-c", harness],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+            self.assertNotEqual(completed.returncode, 0)
 
     def test_preflight_ambiguous_removal_preserves_mount_directories(self):
         completed, events, output = self.run_preflight_fake_docker("ambiguous")

@@ -96,6 +96,91 @@ run_tracked() {
   return "$status"
 }
 
+copy_regular_file_excl() {
+  # Copy source to a temporary file and atomically publish a new target without
+  # following symlinks on either side.  A failed copy never leaves a partial
+  # state file at the destination.
+  python3 -c '
+import os, shutil, stat, sys, tempfile
+mode = int(sys.argv[3], 8)
+source_fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+target_dir = os.path.dirname(sys.argv[2]) or "."
+temp_fd, temp_path = tempfile.mkstemp(prefix="." + os.path.basename(sys.argv[2]) + ".tmp-", dir=target_dir)
+os.close(temp_fd)
+try:
+    if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+        raise ValueError("source must be a regular file")
+    target_fd = os.open(temp_path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, mode)
+    try:
+        if not stat.S_ISREG(os.fstat(target_fd).st_mode):
+            raise ValueError("target must be a regular file")
+        with os.fdopen(source_fd, "rb", closefd=False) as source, os.fdopen(target_fd, "wb", closefd=False) as target:
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+    finally:
+        os.close(target_fd)
+    os.link(temp_path, sys.argv[2], follow_symlinks=False)
+    directory_fd = os.open(target_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    try:
+        os.unlink(temp_path)
+    except FileNotFoundError:
+        pass
+    os.close(source_fd)
+' "$1" "$2" "$3"
+}
+
+copy_sqlite_database_excl() {
+  # Take a consistent SQLite backup, then atomically publish it.  This keeps
+  # preflight aligned with a populated live database without copying a file
+  # mid-transaction.
+  python3 -c '
+import os, sqlite3, stat, sys, tempfile
+source_fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+target_dir = os.path.dirname(sys.argv[2]) or "."
+temp_fd, temp_path = tempfile.mkstemp(prefix="." + os.path.basename(sys.argv[2]) + ".tmp-", dir=target_dir)
+os.close(temp_fd)
+source = target = None
+try:
+    if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+        raise ValueError("SQLite source must be a regular file")
+    source = sqlite3.connect(f"file:/proc/self/fd/{source_fd}?mode=ro", uri=True)
+    target = sqlite3.connect(temp_path)
+    source.backup(target)
+    target.commit()
+    target.close()
+    target = None
+    file_fd = os.open(temp_path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            raise ValueError("SQLite target must be a regular file")
+        os.fsync(file_fd)
+    finally:
+        os.close(file_fd)
+    os.link(temp_path, sys.argv[2], follow_symlinks=False)
+    directory_fd = os.open(target_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    if target is not None:
+        target.close()
+    if source is not None:
+        source.close()
+    try:
+        os.unlink(temp_path)
+    except FileNotFoundError:
+        pass
+    os.close(source_fd)
+' "$1" "$2"
+}
+
 container_inspect_state() {
   local container_name="$1"
   local inspect_error=""
@@ -276,9 +361,42 @@ preflight_image() {
   PREFLIGHT_OUTPUT_DIR=$(mktemp -d)
   chmod 0700 "$PREFLIGHT_STATE_DIR" "$PREFLIGHT_OUTPUT_DIR"
   chown "$runtime_uid:$runtime_gid" "$PREFLIGHT_STATE_DIR" "$PREFLIGHT_OUTPUT_DIR"
-  printf '{}\n' > "$PREFLIGHT_STATE_DIR/jobs.json"
+  # Seed the isolated state with a copy of the real legacy jobs file so the
+  # preflight exercises the same startup import the live container will run.
+  # An image that cannot ingest current production state must fail here,
+  # before the live container is replaced.
+  if [ -L "$APP_DIR/state/jobs.json" ] || { [ -e "$APP_DIR/state/jobs.json" ] && [ ! -f "$APP_DIR/state/jobs.json" ]; }; then
+    echo "Refusing symlinked or non-regular state/jobs.json as the preflight import source." >&2
+    PREFLIGHT_DIRS_SAFE_TO_DELETE=1
+    clear_preflight_dirs
+    return 1
+  elif [ -f "$APP_DIR/state/jobs.json" ]; then
+    if ! copy_regular_file_excl "$APP_DIR/state/jobs.json" "$PREFLIGHT_STATE_DIR/jobs.json" 600; then
+      echo "Could not copy state/jobs.json into the isolated preflight state directory." >&2
+      PREFLIGHT_DIRS_SAFE_TO_DELETE=1
+      clear_preflight_dirs
+      return 1
+    fi
+  else
+    printf '{}\n' > "$PREFLIGHT_STATE_DIR/jobs.json"
+  fi
   chmod 0600 "$PREFLIGHT_STATE_DIR/jobs.json"
   chown "$runtime_uid:$runtime_gid" "$PREFLIGHT_STATE_DIR/jobs.json"
+  if [ -L "$APP_DIR/state/solo_studio.sqlite3" ] || { [ -e "$APP_DIR/state/solo_studio.sqlite3" ] && [ ! -f "$APP_DIR/state/solo_studio.sqlite3" ]; }; then
+    echo "Refusing symlinked or non-regular state/solo_studio.sqlite3 as the preflight database source." >&2
+    PREFLIGHT_DIRS_SAFE_TO_DELETE=1
+    clear_preflight_dirs
+    return 1
+  elif [ -f "$APP_DIR/state/solo_studio.sqlite3" ]; then
+    if ! copy_sqlite_database_excl "$APP_DIR/state/solo_studio.sqlite3" "$PREFLIGHT_STATE_DIR/solo_studio.sqlite3"; then
+      echo "Could not snapshot state/solo_studio.sqlite3 into the isolated preflight state directory." >&2
+      PREFLIGHT_DIRS_SAFE_TO_DELETE=1
+      clear_preflight_dirs
+      return 1
+    fi
+    chmod 0600 "$PREFLIGHT_STATE_DIR/solo_studio.sqlite3"
+    chown "$runtime_uid:$runtime_gid" "$PREFLIGHT_STATE_DIR/solo_studio.sqlite3"
+  fi
 
   if run_container_preflight "$image_tag" "$preflight_name" >/dev/null; then
     :
@@ -530,21 +648,7 @@ if [ ! -e "$APP_DIR/state/jobs.json" ]; then
     echo "Refusing symlinked legacy jobs.json migration source." >&2
     exit 1
   elif [ -f "$APP_DIR/jobs.json" ]; then
-    python3 -c '
-import os, shutil, sys
-source_fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
-try:
-    target_fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o660)
-    try:
-        with os.fdopen(source_fd, "rb", closefd=False) as source, os.fdopen(target_fd, "wb", closefd=False) as target:
-            shutil.copyfileobj(source, target)
-            target.flush()
-            os.fsync(target.fileno())
-    finally:
-        os.close(target_fd)
-finally:
-    os.close(source_fd)
-' "$APP_DIR/jobs.json" "$APP_DIR/state/jobs.json"
+    copy_regular_file_excl "$APP_DIR/jobs.json" "$APP_DIR/state/jobs.json" 660
   elif [ -e "$APP_DIR/jobs.json" ]; then
     echo "Refusing non-regular legacy jobs.json migration source." >&2
     exit 1

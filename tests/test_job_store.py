@@ -280,6 +280,77 @@ class JobStoreTests(unittest.TestCase):
         self.assertEqual(imported["status"], "completed")
         self.assertEqual(imported["stage"], "done")
 
+    def test_import_accepts_exact_production_legacy_records(self):
+        source = Path(self.tmp.name) / "jobs.json"
+        source.write_text(json.dumps({
+            "68539c757ce7": {
+                "id": "68539c757ce7",
+                "topic": "How AI Coding Agents Are Reshaping Software Engineering in 2026",
+                "target_audience": "senior engineers, engineering managers, CTOs, technical founders",
+                "duration_seconds": 900,
+                "platform": "youtube",
+                "tone": "educational",
+                "key_messages": ["AI coding agents now handle most junior developer tasks"],
+                "visual_style": "dark mode tech aesthetic, code on screens",
+                "call_to_action": "Subscribe for weekly deep dives.",
+                "status": "failed",
+                "progress": 0.92,
+                "stage": "assembly",
+                "format": "long",
+                "chapters": 12,
+                "scenes": 36,
+                "created_at": "2026-08-04T18:30:45.923924+00:00",
+                "completed_at": None,
+                "error": "name 'timezone' is not defined",
+                "has_visuals": True,
+                "has_voiceover": True,
+                "stage_names": None,
+            },
+            "e80162e71314": {
+                "id": "e80162e71314",
+                "topic": "ok",
+                "target_audience": "general",
+                "duration_seconds": 60,
+                "platform": "youtube",
+                "tone": "professional",
+                "key_messages": [],
+                "visual_style": "",
+                "call_to_action": "",
+                "status": "completed",
+                "progress": 1.0,
+                "stage": "done",
+                "format": "",
+                "chapters": 0,
+                "scenes": 0,
+                "created_at": "2026-08-18T15:41:36.736704+00:00",
+                "completed_at": None,
+                "error": None,
+                "has_visuals": True,
+                "has_voiceover": True,
+                "has_clips": True,
+                "has_final_video": True,
+                "package_status": "completed",
+                "stage_names": None,
+            },
+        }))
+
+        self.assertEqual(job_store.import_jobs_json_once(source, path=self.db), 2)
+        failed = job_store.get_job("68539c757ce7", self.db)
+        if failed is None:
+            self.fail("legacy failed job was not imported")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["stage"], "assembly")
+        self.assertEqual(failed["progress"], 0.92)
+        self.assertEqual(failed["error"], "name 'timezone' is not defined")
+        self.assertIsNone(failed["completed_at"])
+        completed = job_store.get_job("e80162e71314", self.db)
+        if completed is None:
+            self.fail("legacy completed job was not imported")
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["stage"], "done")
+        self.assertEqual(completed["progress"], 1.0)
+        self.assertEqual(completed["completed_at"], "2026-08-18T15:41:36.736704+00:00")
+
     def test_import_rejects_invalid_max_retries(self):
         source = Path(self.tmp.name) / "jobs.json"
         source.write_text(json.dumps({"legacy": {"id": "legacy", "max_retries": 21}}))
