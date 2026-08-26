@@ -43,12 +43,16 @@ def update_job(job_id: str, **kwargs):
         save_jobs(jobs)
 
 
-def run_stage(job_id: str, name: str, script: str, *args) -> bool:
+def run_stage(job_id: str, name: str, script: str, *args, timeout: int = 300) -> bool:
     """Run a pipeline stage and update job progress."""
     cmd = [sys.executable, str(ENGINES_DIR / script), *args]
     print(f"  [{job_id}] Running: {name}")
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"  [{job_id}] TIMED OUT: {name} after {timeout}s")
+        return False
     if result.returncode != 0:
         print(f"  [{job_id}] FAILED: {name}")
         print(f"  stderr: {result.stderr[:500]}")
@@ -145,8 +149,9 @@ def process_job(job_id: str, job: dict):
         update_job(job_id, stage="render", progress=0.90)
 
         # Stage 8: Final render (MP4)
-        if not run_stage(job_id, "Render", "render_agent.py", str(sb_path), str(out)):
-            update_job(job_id, status="failed", error="Final render failed")
+        render_timeout = _render_timeout_seconds(sb)
+        if not run_stage(job_id, "Render", "render_agent.py", str(sb_path), str(out), timeout=render_timeout):
+            update_job(job_id, status="failed", error=f"Final render failed or timed out after {render_timeout}s")
             return
 
         # Generate thumbnail prompt always
@@ -210,6 +215,12 @@ def _generate_voiceover(out: Path, storyboard: dict):
 
     print(f"  [{out.name}] Would generate voiceover ({len(text)} chars - needs TTS API key)")
     # TTS requires API key - produce the script and note it needs rendering
+
+
+def _render_timeout_seconds(storyboard: dict) -> int:
+    """Scale render timeout with requested duration while keeping a sane floor."""
+    duration = float(storyboard.get("total_duration", 0) or 0)
+    return max(600, min(7200, int(duration * 4) + 180))
 
 
 def _generate_thumbnail_for_job(out: Path, brief_json: Path):

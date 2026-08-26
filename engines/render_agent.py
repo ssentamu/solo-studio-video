@@ -17,7 +17,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 WIDTH = 1920
 HEIGHT = 1080
-FPS = 30
+OUTPUT_WIDTH = 1280
+OUTPUT_HEIGHT = 720
+FPS = 12
 
 
 STYLE_PROFILES = {
@@ -270,19 +272,25 @@ def create_scene_clip(ffmpeg: str, image_path: Path, audio_path: Path, duration:
     run([
         ffmpeg,
         "-y",
+        "-hide_banner",
+        "-loglevel", "error",
         "-loop", "1",
+        "-framerate", "1",
         "-t", f"{duration:.3f}",
         "-i", str(image_path),
         "-i", str(audio_path),
-        "-filter_complex", "[1:a]apad[a]",
-        "-map", "0:v",
+        "-filter_complex",
+        f"[0:v]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},fps={FPS},format=yuv420p[v];[1:a]apad[a]",
+        "-map", "[v]",
         "-map", "[a]",
         "-t", f"{duration:.3f}",
-        "-r", str(FPS),
         "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
+        "-preset", "ultrafast",
+        "-tune", "stillimage",
+        "-crf", "30",
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "96k",
+        "-movflags", "+faststart",
         str(output_path),
     ])
 
@@ -297,6 +305,8 @@ def concat_clips(ffmpeg: str, clips: list[Path], output_path: Path):
     run([
         ffmpeg,
         "-y",
+        "-hide_banner",
+        "-loglevel", "error",
         "-f", "concat",
         "-safe", "0",
         "-i", str(list_path),
@@ -351,7 +361,8 @@ def render_video(storyboard_path: Path, output_dir: Path) -> dict:
     manifest = {
         "title": storyboard.get("title", "Untitled"),
         "profile": profile_name,
-        "resolution": f"{WIDTH}x{HEIGHT}",
+        "source_resolution": f"{WIDTH}x{HEIGHT}",
+        "resolution": f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}",
         "fps": FPS,
         "final_video": final_video.name,
         "scenes": rendered_scenes,
