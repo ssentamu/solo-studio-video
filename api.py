@@ -3,6 +3,7 @@ Solo Studio API - FastAPI server with job management.
 
 POST   /api/jobs          Create a new video job
 GET    /api/jobs/{id}     Get job status + progress
+GET    /api/jobs/{id}/video  Download final rendered MP4
 GET    /api/jobs/{id}/download  Download final package (zip)
 GET    /api/jobs          List recent jobs
 """
@@ -62,6 +63,7 @@ class JobStatus(BaseModel):
     error: Optional[str] = None
     has_visuals: bool = False
     has_voiceover: bool = False
+    has_video: bool = False
 
 
 # Job store (JSON file for persistence)
@@ -134,6 +136,7 @@ async def create_job(brief: BriefRequest):
         "error": None,
         "has_visuals": False,
         "has_voiceover": False,
+        "has_video": False,
     }
 
     all_jobs = _load_jobs()
@@ -199,6 +202,7 @@ async def create_job_from_template(template_id: str):
         "error": None,
         "has_visuals": False,
         "has_voiceover": False,
+        "has_video": False,
     }
 
     all_jobs = _load_jobs()
@@ -252,6 +256,29 @@ async def download_job(job_id: str):
         buf,
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@app.get("/api/jobs/{job_id}/video")
+async def download_video(job_id: str):
+    """Download the final rendered video for a completed job."""
+    all_jobs = _load_jobs()
+    if job_id not in all_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = all_jobs[job_id]
+    if job['status'] != 'completed':
+        raise HTTPException(status_code=400, detail="Job not yet completed")
+
+    video_path = OUTPUT_ROOT / job_id / "final_video.mp4"
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Final video not found")
+
+    safe_topic = "".join(c for c in job['topic'][:30] if c.isalnum() or c in ' _-').strip()
+    filename = f"solo-studio-{safe_topic or job_id}.mp4"
+    return FileResponse(
+        video_path,
+        media_type="video/mp4",
+        filename=filename,
     )
 
 

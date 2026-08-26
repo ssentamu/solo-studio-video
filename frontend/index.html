@@ -451,7 +451,7 @@
         <div class="pipeline-step"></div><div class="pipeline-step"></div>
         <div class="pipeline-step"></div><div class="pipeline-step"></div>
         <div class="pipeline-step"></div><div class="pipeline-step"></div>
-        <div class="pipeline-step"></div>
+        <div class="pipeline-step"></div><div class="pipeline-step"></div>
       </div>
 
       <div class="stats">
@@ -491,6 +491,9 @@
       <div class="stats" id="download-stats"></div>
 
       <div class="mt-20" style="display: flex; gap: 12px; justify-content: center;">
+        <a id="video-link" class="btn btn-secondary" href="#" download>
+          <span>Download Video (.mp4)</span>
+        </a>
         <a id="download-link" class="btn" href="#" download>
           <span>⬇ Download Package (.zip)</span>
         </a>
@@ -625,7 +628,7 @@ function updateJobView(job) {
   document.getElementById('stat-scenes').textContent = job.scenes || '—';
 
   // Pipeline steps
-  const stages = ['research', 'script', 'visuals', 'voiceover', 'video_prompts', 'music', 'captions', 'editor_export', 'assembly'];
+  const stages = ['research', 'script', 'visuals', 'voiceover', 'video_prompts', 'music', 'captions', 'editor_export', 'render', 'assembly'];
   const currentIdx = stages.indexOf(job.stage);
   const steps = document.getElementById('pipeline-steps').children;
   for (let i = 0; i < steps.length; i++) {
@@ -665,6 +668,7 @@ function formatStage(stage) {
     music: 'Composing background music...',
     captions: 'Generating captions...',
     editor_export: 'Exporting editor project file...',
+    render: 'Rendering final video...',
     assembly: 'Assembling final package...',
     done: 'Complete!',
   };
@@ -686,6 +690,7 @@ function showDownloadView(job) {
     { label: 'Music Prompt', ok: true },
     { label: 'Captions (.srt)', ok: true },
     { label: 'Assembly Manifest', ok: true },
+    { label: 'Final Video (.mp4)', ok: job.has_video },
   ];
   pills.innerHTML = items.map(i =>
     `<span class="pill${i.ok ? ' ok' : ''}">${i.ok ? '✓' : '○'} ${i.label}</span>`
@@ -707,6 +712,7 @@ function showDownloadView(job) {
     </div>
   `;
 
+  document.getElementById('video-link').href = API + '/jobs/' + job.id + '/video';
   document.getElementById('download-link').href = API + '/jobs/' + job.id + '/download';
 }
 

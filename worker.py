@@ -69,8 +69,9 @@ def process_job(job_id: str, job: dict):
         ("video_prompts", 0.50, 0.62),
         ("music",         0.62, 0.72),
         ("captions",      0.72, 0.82),
-        ("editor_export", 0.82, 0.92),
-        ("assembly",      0.92, 1.00),
+        ("editor_export", 0.82, 0.90),
+        ("render",        0.90, 0.98),
+        ("assembly",      0.98, 1.00),
     ]
 
     try:
@@ -141,6 +142,13 @@ def process_job(job_id: str, job: dict):
         if not run_stage(job_id, "Editor Export", "editor_export.py", str(sb_path), str(out)):
             print(f"  [{job_id}] Editor export failed - continuing")
 
+        update_job(job_id, stage="render", progress=0.90)
+
+        # Stage 8: Final render (MP4)
+        if not run_stage(job_id, "Render", "render_agent.py", str(sb_path), str(out)):
+            update_job(job_id, status="failed", error="Final render failed")
+            return
+
         # Generate thumbnail prompt always
         try:
             _generate_thumbnail_for_job(out, brief_json)
@@ -157,6 +165,7 @@ def process_job(job_id: str, job: dict):
             stage="done",
             progress=1.0,
             completed_at=datetime.now(timezone.utc).isoformat(),
+            has_video=True,
         )
         print(f"  [{job_id}] COMPLETED - {sb.get('total_duration', 0):.0f}s, {len(sb.get('scenes', []))} scenes")
 

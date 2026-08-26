@@ -8,6 +8,7 @@ Runs all 5 stages:
   3. Design Agent    -> Visual Prompts + Generated Images
   4. Production Agent -> Voiceover + Video Prompts + Music Prompt
   5. Editing Agent   -> Captions + Assembly Manifest
+  6. Render Agent    -> Final stitched MP4
 
 Usage:
   python pipeline.py briefs/my_video.yaml
@@ -92,6 +93,10 @@ def main():
     if not run_stage("6. Editor Export", "editor_export.py", str(storyboard_json), str(out)):
         print("  WARNING: Editor export failed")
 
+    # Stage 7: Final render
+    if not run_stage("7. Render Agent", "render_agent.py", str(storyboard_json), str(out)):
+        sys.exit(1)
+
     # Generate thumbnail prompt (always, even with --skip-visuals)
     _generate_thumbnail_prompt(out, brief_json)
 
@@ -102,8 +107,8 @@ def main():
     print(f"\n  Output: {out}/")
     _print_output_tree(out)
     print(f"\n  Import {out}/timeline.fcpxml into DaVinci Resolve or Premiere Pro.")
-    print(f"  To generate visuals: run with image generation enabled.")
-    print(f"  To generate voiceover: configure ELEVENLABS_API_KEY and rerun.")
+    print(f"  Final video: {out}/final_video.mp4")
+    print(f"  To upgrade visuals/voices: configure provider-backed generation and rerun.")
 
 
 def _generate_thumbnail_prompt(out: Path, brief_json: Path):
