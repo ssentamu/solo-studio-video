@@ -20,6 +20,9 @@ HEIGHT = 1080
 OUTPUT_WIDTH = 1280
 OUTPUT_HEIGHT = 720
 FPS = 12
+MIN_SCENE_SECONDS = 2.5
+SCENE_TAIL_SECONDS = 0.35
+TRANSITION_SECONDS = 0.45
 
 
 STYLE_PROFILES = {
@@ -240,6 +243,7 @@ def run(cmd: list[str], cwd: Path | None = None):
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr[-1200:]}")
+    return result
 
 
 def require_ffmpeg() -> str:
@@ -249,26 +253,62 @@ def require_ffmpeg() -> str:
     return ffmpeg
 
 
-def generate_scene_audio(ffmpeg: str, scene: dict, duration: float, path: Path):
+def require_ffprobe() -> str:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("ffprobe is required to time generated narration but was not found on PATH")
+    return ffprobe
+
+
+def probe_duration(ffprobe: str, path: Path) -> float:
+    result = run([
+        ffprobe,
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ])
+    try:
+        return max(0.0, float(result.stdout.strip()))
+    except ValueError:
+        return 0.0
+
+
+def generate_scene_audio(ffmpeg: str, ffprobe: str, scene: dict, planned_duration: float, path: Path) -> float:
     narration = scene.get("narration", "").strip()
     tts = shutil.which("espeak-ng") or shutil.which("espeak")
     if narration and tts:
         text_path = path.with_suffix(".txt")
         text_path.write_text(narration, encoding="utf-8")
-        run([tts, "-w", str(path), "-s", "155", "-f", str(text_path)])
-        return
+        run([
+            tts,
+            "-v", "en-us",
+            "-w", str(path),
+            "-s", "138",
+            "-p", "38",
+            "-a", "135",
+            "-g", "7",
+            "-f", str(text_path),
+        ])
+        duration = probe_duration(ffprobe, path)
+        return max(MIN_SCENE_SECONDS, duration + SCENE_TAIL_SECONDS)
 
     run([
         ffmpeg,
         "-y",
+        "-hide_banner",
+        "-loglevel", "error",
         "-f", "lavfi",
         "-i", "anullsrc=r=48000:cl=stereo",
-        "-t", f"{duration:.3f}",
+        "-t", f"{planned_duration:.3f}",
         str(path),
     ])
+    return planned_duration
 
 
 def create_scene_clip(ffmpeg: str, image_path: Path, audio_path: Path, duration: float, output_path: Path):
+    fade = min(0.30, duration / 5)
+    fade_out = max(0, duration - fade)
     run([
         ffmpeg,
         "-y",
@@ -280,7 +320,12 @@ def create_scene_clip(ffmpeg: str, image_path: Path, audio_path: Path, duration:
         "-i", str(image_path),
         "-i", str(audio_path),
         "-filter_complex",
-        f"[0:v]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},fps={FPS},format=yuv420p[v];[1:a]apad[a]",
+        (
+            f"[0:v]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},fps={FPS},format=yuv420p,"
+            f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={fade_out:.3f}:d={fade:.3f}[v];"
+            f"[1:a]loudnorm=I=-18:TP=-2:LRA=11,afade=t=in:st=0:d=0.080,"
+            f"afade=t=out:st={max(0, duration - 0.18):.3f}:d=0.180,apad[a]"
+        ),
         "-map", "[v]",
         "-map", "[a]",
         "-t", f"{duration:.3f}",
@@ -295,7 +340,7 @@ def create_scene_clip(ffmpeg: str, image_path: Path, audio_path: Path, duration:
     ])
 
 
-def concat_clips(ffmpeg: str, clips: list[Path], output_path: Path):
+def concat_clips_copy(ffmpeg: str, clips: list[Path], output_path: Path):
     list_path = output_path.parent / "clips" / "concat.txt"
     with open(list_path, "w", encoding="utf-8") as f:
         for clip in clips:
@@ -315,8 +360,61 @@ def concat_clips(ffmpeg: str, clips: list[Path], output_path: Path):
     ])
 
 
+def concat_clips(ffmpeg: str, clips: list[Path], durations: list[float], output_path: Path):
+    if len(clips) == 1:
+        shutil.copyfile(clips[0], output_path)
+        return
+
+    transition = min(TRANSITION_SECONDS, min(durations) / 4)
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+    for clip in clips:
+        cmd.extend(["-i", str(clip)])
+
+    filters = []
+    for idx in range(len(clips)):
+        filters.append(f"[{idx}:v]setpts=PTS-STARTPTS[v{idx}]")
+        filters.append(f"[{idx}:a]asetpts=PTS-STARTPTS[a{idx}]")
+
+    video_label = "v0"
+    audio_label = "a0"
+    elapsed = durations[0]
+    for idx in range(1, len(clips)):
+        next_video = f"vx{idx}"
+        next_audio = f"ax{idx}"
+        offset = max(0, elapsed - transition)
+        filters.append(
+            f"[{video_label}][v{idx}]xfade=transition=fade:duration={transition:.3f}:offset={offset:.3f}[{next_video}]"
+        )
+        filters.append(
+            f"[{audio_label}][a{idx}]acrossfade=d={transition:.3f}:c1=tri:c2=tri[{next_audio}]"
+        )
+        video_label = next_video
+        audio_label = next_audio
+        elapsed += durations[idx] - transition
+
+    cmd.extend([
+        "-filter_complex", ";".join(filters),
+        "-map", f"[{video_label}]",
+        "-map", f"[{audio_label}]",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "30",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "96k",
+        "-movflags", "+faststart",
+        str(output_path),
+    ])
+
+    try:
+        run(cmd)
+    except RuntimeError:
+        concat_clips_copy(ffmpeg, clips, output_path)
+
+
 def render_video(storyboard_path: Path, output_dir: Path) -> dict:
     ffmpeg = require_ffmpeg()
+    ffprobe = require_ffprobe()
     storyboard = load_json(storyboard_path)
     brief_path = output_dir / "creative_brief.json"
     brief = load_json(brief_path) if brief_path.exists() else {}
@@ -330,6 +428,7 @@ def render_video(storyboard_path: Path, output_dir: Path) -> dict:
     audio_dir.mkdir(parents=True, exist_ok=True)
 
     clips = []
+    durations = []
     rendered_scenes = []
     scenes = storyboard.get("scenes", [])
     if not scenes:
@@ -337,26 +436,28 @@ def render_video(storyboard_path: Path, output_dir: Path) -> dict:
 
     for scene in scenes:
         scene_number = scene.get("scene_number", len(clips) + 1)
-        duration = max(1.0, float(scene.get("duration_seconds", 5.0)))
+        planned_duration = max(MIN_SCENE_SECONDS, float(scene.get("duration_seconds", 5.0)))
         image_path = renders_dir / f"scene_{scene_number:02d}.png"
         audio_path = audio_dir / f"scene_{scene_number:02d}.wav"
         clip_path = clips_dir / f"scene_{scene_number:02d}.mp4"
 
         create_scene_card(scene, storyboard, brief, profile_name, image_path)
-        generate_scene_audio(ffmpeg, scene, duration, audio_path)
+        duration = generate_scene_audio(ffmpeg, ffprobe, scene, planned_duration, audio_path)
         create_scene_clip(ffmpeg, image_path, audio_path, duration, clip_path)
 
         clips.append(clip_path)
+        durations.append(duration)
         rendered_scenes.append({
             "scene_number": scene_number,
-            "duration_seconds": duration,
+            "planned_duration_seconds": planned_duration,
+            "rendered_duration_seconds": duration,
             "image": str(image_path.relative_to(output_dir)),
             "audio": str(audio_path.relative_to(output_dir)),
             "clip": str(clip_path.relative_to(output_dir)),
         })
 
     final_video = output_dir / "final_video.mp4"
-    concat_clips(ffmpeg, clips, final_video)
+    concat_clips(ffmpeg, clips, durations, final_video)
 
     manifest = {
         "title": storyboard.get("title", "Untitled"),
@@ -368,7 +469,8 @@ def render_video(storyboard_path: Path, output_dir: Path) -> dict:
         "scenes": rendered_scenes,
         "notes": [
             "This renderer creates a complete stitched MP4 from generated scene cards.",
-            "If espeak/espeak-ng is installed, narration audio is generated automatically.",
+            "Scene timing follows generated narration to avoid dead air before transitions.",
+            "Soft fades, audio normalization, and crossfades are applied between scenes.",
             "Provider-backed image, voice, and video generation can replace these local assets later.",
         ],
     }
