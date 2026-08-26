@@ -505,7 +505,10 @@
 console.log('Solo Studio JS loaded');
 // Hide JS warning banner — proves JS is executing
 document.getElementById('js-test').style.display = 'none';
-const API = '/video/api';
+const BASE_PATH = window.location.pathname === '/video' || window.location.pathname.startsWith('/video/')
+  ? '/video'
+  : '';
+const API = BASE_PATH + '/api';
 let currentJobId = null;
 let pollTimer = null;
 
@@ -569,18 +572,25 @@ document.getElementById('brief-form').addEventListener('submit', async (e) => {
 // ── Poll job status ──
 function pollJob() {
   if (!currentJobId) return;
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
 
-  pollTimer = setInterval(async () => {
+  const fetchStatus = async () => {
     try {
       const res = await fetch(API + '/jobs/' + currentJobId);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
       const job = await res.json();
       updateJobView(job);
 
       if (job.status === 'completed') {
         clearInterval(pollTimer);
+        pollTimer = null;
         showDownloadView(job);
       } else if (job.status === 'failed') {
         clearInterval(pollTimer);
+        pollTimer = null;
       }
 
       // Also update recent jobs in background
@@ -588,7 +598,10 @@ function pollJob() {
     } catch (err) {
       console.error('Poll error:', err);
     }
-  }, 1500);
+  };
+
+  fetchStatus();
+  pollTimer = setInterval(fetchStatus, 1500);
 }
 
 function updateJobView(job) {
@@ -732,6 +745,7 @@ function viewJob(jobId) {
 async function loadJobStatus(jobId) {
   try {
     const res = await fetch(API + '/jobs/' + jobId);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
     const job = await res.json();
     updateJobView(job);
 
@@ -849,6 +863,7 @@ function selectTemplate(templateId, el) {
 async function quickStart(templateId) {
   const btn = document.querySelector('#quick-start-row button');
   if (btn) {
+    btn.dataset.originalLabel = btn.textContent.trim();
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span> Creating...';
   }
@@ -865,7 +880,7 @@ async function quickStart(templateId) {
   } finally {
     if (btn) {
       btn.disabled = false;
-      btn.innerHTML = btn.textContent.replace('Creating...', 'Generate');
+      btn.textContent = btn.dataset.originalLabel || 'Generate from Template';
     }
   }
 }

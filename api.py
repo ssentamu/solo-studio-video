@@ -1,24 +1,25 @@
 """
-Solo Studio API — FastAPI server with job management.
+Solo Studio API - FastAPI server with job management.
 
 POST   /api/jobs          Create a new video job
 GET    /api/jobs/{id}     Get job status + progress
 GET    /api/jobs/{id}/download  Download final package (zip)
 GET    /api/jobs          List recent jobs
 """
-import json, uuid, shutil, zipfile, io, time
+import json, uuid, zipfile, io
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import yaml
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
-# ── Config — auto-detect base dir (works in Docker and local) ──
+# Config - auto-detect base dir (works in Docker and local)
 APP_DIR = Path(__file__).resolve().parent
 OUTPUT_ROOT = APP_DIR / "output"
 JOBS_FILE = APP_DIR / "jobs.json"
@@ -41,7 +42,7 @@ class BriefRequest(BaseModel):
     duration_minutes: float = Field(default=1.0, ge=0.5, le=90)
     platform: str = "youtube"
     tone: str = "professional"
-    key_messages: list[str] = []
+    key_messages: list[str] = Field(default_factory=list)
     visual_style: str = ""
     call_to_action: str = ""
 
@@ -63,35 +64,33 @@ class JobStatus(BaseModel):
     has_voiceover: bool = False
 
 
-# ── Job store (in-memory + JSON file for persistence) ──
+# Job store (JSON file for persistence)
 def _load_jobs() -> dict:
     if JOBS_FILE.exists():
         try:
-            with open(JOBS_FILE) as f:
+            with open(JOBS_FILE, encoding="utf-8") as f:
                 content = f.read().strip()
                 if content:
                     return json.loads(content)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, OSError, ValueError):
             pass
     return {}
 
 
 def _save_jobs(jobs: dict):
     JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(JOBS_FILE, 'w') as f:
+    with open(JOBS_FILE, 'w', encoding="utf-8") as f:
         json.dump(jobs, f, indent=2)
 
 
-jobs = _load_jobs()
-
-
 def get_job(job_id: str) -> dict:
+    jobs = _load_jobs()
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     return jobs[job_id]
 
 
-# ── Routes ──
+# Routes
 @app.get("/")
 async def index():
     """Serve the frontend."""
@@ -137,8 +136,9 @@ async def create_job(brief: BriefRequest):
         "has_voiceover": False,
     }
 
-    jobs[job_id] = job
-    _save_jobs(jobs)
+    all_jobs = _load_jobs()
+    all_jobs[job_id] = job
+    _save_jobs(all_jobs)
 
     # Write the brief YAML for the worker
     brief_path = OUTPUT_ROOT / job_id / "brief.yaml"
@@ -156,7 +156,7 @@ async def list_templates():
         templates_path = Path(__file__).parent / "templates.json"
     if not templates_path.exists():
         return []
-    with open(templates_path) as f:
+    with open(templates_path, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -167,7 +167,7 @@ async def create_job_from_template(template_id: str):
     if not templates_path.exists():
         raise HTTPException(status_code=404, detail="No templates available")
 
-    with open(templates_path) as f:
+    with open(templates_path, encoding="utf-8") as f:
         templates = json.load(f)
 
     template = next((t for t in templates if t['id'] == template_id), None)
@@ -255,27 +255,25 @@ async def download_job(job_id: str):
     )
 
 
-# ── Helpers ──
+# Helpers
 def _write_brief_yaml(path: Path, job: dict):
     """Write a brief YAML file for the pipeline worker."""
-    lines = [
-        f"topic: \"{job['topic']}\"",
-        f"target_audience: \"{job['target_audience']}\"",
-        f"duration_seconds: {job['duration_seconds']}",
-        f"platform: \"{job['platform']}\"",
-        f"tone: \"{job['tone']}\"",
-        f"key_messages:",
-    ]
-    for msg in job.get('key_messages', []):
-        lines.append(f'  - "{msg}"')
-    lines.append(f'visual_style: "{job.get("visual_style", "")}"')
-    lines.append(f'call_to_action: "{job.get("call_to_action", "")}"')
+    brief = {
+        "topic": job["topic"],
+        "target_audience": job["target_audience"],
+        "duration_seconds": job["duration_seconds"],
+        "platform": job["platform"],
+        "tone": job["tone"],
+        "key_messages": job.get("key_messages", []),
+        "visual_style": job.get("visual_style", ""),
+        "call_to_action": job.get("call_to_action", ""),
+    }
 
-    with open(path, 'w') as f:
-        f.write('\n'.join(lines) + '\n')
+    with open(path, 'w', encoding="utf-8") as f:
+        yaml.safe_dump(brief, f, sort_keys=False, allow_unicode=True)
 
 
-# Mount frontend static files — serve everything under /
+# Mount frontend static files - serve everything under /
 # API routes (/api/*) take priority over static files
 FRONTEND_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

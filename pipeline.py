@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Solo Studio Video Pipeline — Orchestrator
+Solo Studio Video Pipeline - Orchestrator
 
 Runs all 5 stages:
-  1. Research Agent  → Creative Brief
-  2. Script Agent    → Script + Storyboard
-  3. Design Agent    → Visual Prompts + Generated Images
-  4. Production Agent → Voiceover + Video Prompts + Music Prompt
-  5. Editing Agent   → Captions + Assembly Manifest
+  1. Research Agent  -> Creative Brief
+  2. Script Agent    -> Script + Storyboard
+  3. Design Agent    -> Visual Prompts + Generated Images
+  4. Production Agent -> Voiceover + Video Prompts + Music Prompt
+  5. Editing Agent   -> Captions + Assembly Manifest
 
 Usage:
   python pipeline.py briefs/my_video.yaml
@@ -28,9 +28,9 @@ def run_stage(name: str, script: str, *args) -> bool:
     print(f"{'='*60}")
     result = subprocess.run(cmd, capture_output=False)
     if result.returncode != 0:
-        print(f"  ✗ FAILED (exit {result.returncode})")
+        print(f"  FAILED (exit {result.returncode})")
         return False
-    print(f"  ✓ Done")
+    print("  Done")
     return True
 
 
@@ -56,7 +56,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'#'*60}")
-    print(f"  SOLO STUDIO — Video Production Pipeline")
+    print(f"  SOLO STUDIO - Video Production Pipeline")
     print(f"  Brief: {brief_path}")
     print(f"  Output: {out}")
     print(f"{'#'*60}")
@@ -76,21 +76,21 @@ def main():
     # Stage 3: Design (Visuals)
     if not args.skip_visuals:
         if not run_stage("3. Design Agent", "design_agent.py", str(storyboard_json), str(out)):
-            print("  ⚠ Design agent failed — continuing with remaining stages")
+            print("  WARNING: Design agent failed - continuing with remaining stages")
     else:
-        print(f"\n  ⏭ Skipping visuals (--skip-visuals)")
+        print("\n  Skipping visuals (--skip-visuals)")
 
     # Stage 4: Production (Voiceover + Video Prompts + Music)
     if not run_stage("4. Production Agent", "production_agent.py", str(storyboard_json), str(out)):
-        print("  ⚠ Production agent failed — continuing with remaining stages")
+        print("  WARNING: Production agent failed - continuing with remaining stages")
 
     # Stage 5: Editing (Captions + Assembly)
     if not run_stage("5. Editing Agent", "editing_agent.py", str(storyboard_json), str(out)):
-        print("  ⚠ Editing agent failed")
+        print("  WARNING: Editing agent failed")
 
     # Stage 6: Editor Export (DaVinci Resolve / Premiere Pro)
     if not run_stage("6. Editor Export", "editor_export.py", str(storyboard_json), str(out)):
-        print("  ⚠ Editor export failed")
+        print("  WARNING: Editor export failed")
 
     # Generate thumbnail prompt (always, even with --skip-visuals)
     _generate_thumbnail_prompt(out, brief_json)
@@ -122,7 +122,7 @@ def _generate_thumbnail_prompt(out: Path, brief_json: Path):
         dur = sb.get('total_duration', 60)
         hooks = {
             'educational': f"The TRUTH About {topic[:35]}",
-            'professional': f"{topic[:35]} — {int(dur)}s",
+            'professional': f"{topic[:35]} - {int(dur)}s",
             'cinematic': topic[:35].upper(),
             'energetic': f"DON'T Ignore {topic[:35]}!",
             'casual': f"I Tried {topic[:35]}",
@@ -138,7 +138,7 @@ def _generate_thumbnail_prompt(out: Path, brief_json: Path):
             json.dump({'title_overlay': overlay, 'prompt': prompt, 'filename': 'youtube_thumbnail.png'}, f, indent=2)
         print(f"  Thumbnail prompt: {tp}")
     except Exception as e:
-        print(f"  ⚠ Thumbnail prompt failed: {e}")
+        print(f"  WARNING: Thumbnail prompt failed: {e}")
 
 
 def _print_output_tree(out: Path):

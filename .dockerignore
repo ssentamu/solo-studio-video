@@ -1,0 +1,16 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+
+jobs.json
+output
+
+.idea
+.vscode
+*.swp
+*.swo
+
+.DS_Store
+Thumbs.db
