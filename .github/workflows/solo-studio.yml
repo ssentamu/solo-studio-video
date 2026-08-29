@@ -49,7 +49,5 @@ jobs:
             python -m py_compile api.py auth_store.py audio_generation.py job_store.py media_assembly.py music_generation.py package_utils.py pipeline.py provider_canary.py runtime_init.py worker.py engines/*.py
             python -c "import api, audio_generation, job_store, media_assembly, music_generation, package_utils, pipeline, provider_canary, worker"
             python provider_canary.py > /tmp/provider-canary.json
-            grep -q '"live": false' /tmp/provider-canary.json
-            grep -q '"network_called": false' /tmp/provider-canary.json
-            grep -q '"status": "dry_run"' /tmp/provider-canary.json
+            python -c "import json; from pathlib import Path; report=json.loads(Path(\"/tmp/provider-canary.json\").read_text()); print(json.dumps(report, sort_keys=True)); assert report[\"live\"] is False; assert report[\"network_called\"] is False; assert report[\"status\"] == \"dry_run\"; print(\"CONTAINER_SMOKE=PASS\")"
           '
