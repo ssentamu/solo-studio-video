@@ -19,7 +19,7 @@ from package_utils import update_json_file
 
 class ImportConfigurationTests(unittest.TestCase):
     def test_api_token_fifo_does_not_block_module_import(self):
-        with tempfile.TemporaryDirectory(dir="/opt/data", prefix="hermes-verify-") as tmp:
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir(), prefix="hermes-verify-") as tmp:
             token_fifo = Path(tmp) / "token.fifo"
             os.mkfifo(token_fifo)
             environment = os.environ.copy()
@@ -38,7 +38,7 @@ class ImportConfigurationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_api_token_file_rejects_surrounding_whitespace(self):
-        with tempfile.TemporaryDirectory(dir="/opt/data", prefix="hermes-verify-") as tmp:
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir(), prefix="hermes-verify-") as tmp:
             root = Path(tmp)
             environment = os.environ.copy()
             environment["SOLO_STUDIO_REQUIRE_API_TOKEN"] = "0"
@@ -60,7 +60,7 @@ class ImportConfigurationTests(unittest.TestCase):
                 self.assertEqual(result.stdout, expected)
 
     def test_external_database_root_parity_holds_at_module_import(self):
-        with tempfile.TemporaryDirectory(dir="/opt/data", prefix="hermes-verify-") as tmp:
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir(), prefix="hermes-verify-") as tmp:
             database = Path(tmp) / "external" / "state.sqlite3"
             environment = os.environ.copy()
             environment["SOLO_STUDIO_DATABASE_FILE"] = str(database)
@@ -82,7 +82,7 @@ class ImportConfigurationTests(unittest.TestCase):
             self.assertEqual(len(roots), 2, result.stdout)
             self.assertEqual(roots[0], roots[1])
     def test_bounded_subprocess_reaps_detached_grandchild(self):
-        with tempfile.TemporaryDirectory(dir="/opt/data", prefix="hermes-verify-") as tmp:
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir(), prefix="hermes-verify-") as tmp:
             marker = Path(tmp) / "detached-pid"
             child_code = (
                 "import os,time\n"
@@ -541,7 +541,7 @@ class ResumeAndIdentifierTests(unittest.TestCase):
             name: getattr(worker, name)
             for name in ("DATABASE_CONFIGURED", "DATABASE_FILE", "OUTPUT_ROOT", "CURRENT_WORKER_ID", "CURRENT_RUN_ID", "WORKER_ID")
         }
-        with tempfile.TemporaryDirectory(dir="/opt/data") as tmp, patch.dict(
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir()) as tmp, patch.dict(
             os.environ, {"SOLO_STUDIO_RETRY_STAGE_FAILURES": "0"}, clear=False
         ):
             try:
@@ -582,7 +582,7 @@ class ResumeAndIdentifierTests(unittest.TestCase):
             name: getattr(worker, name)
             for name in ("DATABASE_CONFIGURED", "DATABASE_FILE", "OUTPUT_ROOT", "CURRENT_WORKER_ID", "CURRENT_RUN_ID", "WORKER_ID")
         }
-        with tempfile.TemporaryDirectory(dir="/opt/data") as tmp:
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir()) as tmp:
             try:
                 root = Path(tmp)
                 worker.DATABASE_CONFIGURED = True
@@ -617,7 +617,7 @@ class ResumeAndIdentifierTests(unittest.TestCase):
 
 class WorkerMusicIntegrationTests(unittest.TestCase):
     def test_disabled_music_generation_is_network_free_and_reports_existing_artifact(self):
-        with tempfile.TemporaryDirectory(dir="/opt/data", prefix="hermes-verify-") as tmp:
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir(), prefix="hermes-verify-") as tmp:
             root = Path(tmp)
             (root / "audio").mkdir()
             (root / "music_prompt.txt").write_text("ambient technology bed", encoding="utf-8")
@@ -628,7 +628,7 @@ class WorkerMusicIntegrationTests(unittest.TestCase):
             probe.assert_called_once_with(root / "audio" / "background_music.mp3")
 
     def test_enabled_music_generation_persists_safe_metadata(self):
-        with tempfile.TemporaryDirectory(dir="/opt/data", prefix="hermes-verify-") as tmp:
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir(), prefix="hermes-verify-") as tmp:
             root = Path(tmp)
             (root / "music_prompt.txt").write_text("ambient technology bed", encoding="utf-8")
             metadata = {
@@ -667,7 +667,7 @@ class WorkerMusicIntegrationTests(unittest.TestCase):
             self.assertEqual(persisted, {**metadata, "sha256": "a" * 64})
 
     def test_music_provider_failure_is_normalized(self):
-        with tempfile.TemporaryDirectory(dir="/opt/data", prefix="hermes-verify-") as tmp:
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir(), prefix="hermes-verify-") as tmp:
             root = Path(tmp)
             (root / "music_prompt.txt").write_text("ambient technology bed", encoding="utf-8")
             with patch.dict(os.environ, {"SOLO_STUDIO_ENABLE_HIGGSFIELD": "1"}, clear=False), patch(
@@ -677,7 +677,7 @@ class WorkerMusicIntegrationTests(unittest.TestCase):
             self.assertFalse((root / "audio" / "music_metadata.json").exists())
 
     def test_invalid_music_metadata_is_rejected_without_persistence(self):
-        with tempfile.TemporaryDirectory(dir="/opt/data", prefix="hermes-verify-") as tmp:
+        with tempfile.TemporaryDirectory(dir=tempfile.gettempdir(), prefix="hermes-verify-") as tmp:
             root = Path(tmp)
             (root / "music_prompt.txt").write_text("ambient technology bed", encoding="utf-8")
             invalid_metadata = {

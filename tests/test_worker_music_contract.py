@@ -11,7 +11,7 @@ import worker
 
 class WorkerMusicContractTests(unittest.TestCase):
     def _root(self):
-        return tempfile.TemporaryDirectory(dir="/opt/data", prefix="hermes-verify-")
+        return tempfile.TemporaryDirectory(dir=tempfile.gettempdir(), prefix="hermes-verify-")
 
     def _metadata(self, *, bytes_count=128, duration=30.0):
         return {
