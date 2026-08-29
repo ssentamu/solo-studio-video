@@ -10,7 +10,7 @@ import json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dataclasses import dataclass, field, asdict
-from package_utils import atomic_write_json, atomic_write_text, read_json_artifact
+from package_utils import atomic_write_json, atomic_write_text, read_json_artifact, validate_output_profile_contract
 from enum import Enum
 
 
@@ -112,7 +112,7 @@ def generate_chapter_plan(duration: float, fmt: VideoFormat, messages: list[str]
             ("COUNTER-ARGUMENTS & NUANCE", duration * 0.06, "context"),
             ("SYNTHESIS: The Big Picture", duration * 0.08, "synthesis"),
             ("ACTIONABLE TAKEAWAYS", duration * 0.06, "cta"),
-            ("OUTRO & NEXT VIDEO", duration * 0.04, "cta"),
+            ("OUTRO & NEXT VIDEO", duration * 0.09, "cta"),
         ])
     else:  # DOCUMENTARY
         # For 30+ min: full episode structure
@@ -128,8 +128,14 @@ def generate_chapter_plan(duration: float, fmt: VideoFormat, messages: list[str]
             ("PART 6: WHERE THIS IS GOING", duration * 0.10, "deep_dive"),
             ("PART 7: WHAT TO DO ABOUT IT", duration * 0.08, "synthesis"),
             ("CLOSING ARGUMENT", duration * 0.06, "synthesis"),
-            ("CREDITS & CALL TO ACTION", duration * 0.03, "cta"),
+            ("CREDITS & CALL TO ACTION", duration * 0.08, "cta"),
         ]
+
+    # Keep the chapter contract exact even if a future percentage edit drifts.
+    if plan:
+        preceding = sum(item[1] for item in plan[:-1])
+        title, _, purpose = plan[-1]
+        plan[-1] = (title, duration - preceding, purpose)
 
     for title, dur, purpose in plan:
         chapters.append(Chapter(title=title, start_time=t, duration=dur, purpose=purpose))
@@ -162,7 +168,8 @@ def generate_scenes(chapters: list[Chapter], topic: str, tone: str, platform: st
         else:
             scene_count = max(2, int(ch_dur / 30))
 
-        scene_dur = ch_dur / scene_count
+        scene_durations = [round(ch_dur / scene_count, 1) for _ in range(scene_count - 1)]
+        scene_durations.append(ch_dur - sum(scene_durations))
 
         for i in range(scene_count):
             scene_num += 1
@@ -178,7 +185,7 @@ def generate_scenes(chapters: list[Chapter], topic: str, tone: str, platform: st
             scenes.append(Scene(
                 scene_number=scene_num,
                 chapter=ch.title,
-                duration_seconds=round(scene_dur, 1),
+                duration_seconds=scene_durations[i],
                 visual_description=visual,
                 narration=narration,
                 text_overlay=overlay,
@@ -341,6 +348,7 @@ def generate_script(brief: dict) -> Storyboard:
     platform = brief.get('platform', 'youtube')
     duration = brief.get('duration_seconds', 60)
     messages = brief.get('key_messages', [])
+    profile = validate_output_profile_contract(brief, "creative brief")
 
     fmt = detect_format(duration)
 
@@ -360,6 +368,9 @@ def generate_script(brief: dict) -> Storyboard:
         full_script="",
     )
     sb.full_script = build_full_script(sb)
+    sb.output_profile = profile["output_profile"]
+    sb.aspect_ratio = profile["aspect_ratio"]
+    sb.resolution = profile["resolution"]
     return sb
 
 
@@ -385,6 +396,9 @@ def main():
     atomic_write_json(sb_path, {
         'title': storyboard.title,
         'format': storyboard.format,
+        'output_profile': getattr(storyboard, 'output_profile', 'landscape'),
+        'aspect_ratio': getattr(storyboard, 'aspect_ratio', '16:9'),
+        'resolution': getattr(storyboard, 'resolution', '1920x1080'),
         'total_duration': storyboard.total_duration,
         'chapters': [asdict(c) for c in storyboard.chapters],
         'scenes': [asdict(s) for s in storyboard.scenes],

@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
-from package_utils import atomic_write_text, read_json_artifact
+from package_utils import atomic_write_text, read_json_artifact, validate_output_profile_contract
 
 
 def load_json(path: str) -> dict:
@@ -47,6 +47,9 @@ def generate_fcpxml(storyboard: dict, manifest: dict) -> str:
     if scene_numbers != list(range(1, len(scene_numbers) + 1)):
         raise ValueError("scene numbers must be contiguous starting at 1")
     title = storyboard.get('title', 'Untitled')
+    profile = validate_output_profile_contract(storyboard, "storyboard")
+    width = profile["width"]
+    height = profile["height"]
 
     fps_num, fps_den, fps = _timebase(manifest.get('export', {}).get('fps', 30))
     frame_duration = f'{fps_num}/{fps_den}s'
@@ -77,10 +80,10 @@ def generate_fcpxml(storyboard: dict, manifest: dict) -> str:
     # Video format
     fmt = SubElement(resources, 'format', {
         'id': 'r1',
-        'name': f'FFVideoFormat1080p{fps:g}',
+        'name': f'FFVideoFormat{width}x{height}_{fps:g}',
         'frameDuration': frame_duration,
-        'width': '1920',
-        'height': '1080',
+        'width': str(width),
+        'height': str(height),
         'colorSpace': '1-1-1 (Rec. 709)',
     })
     SubElement(resources, 'effect', {

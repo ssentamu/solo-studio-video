@@ -7,7 +7,7 @@ Output: captions.srt + assembly_manifest.json
 import json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from package_utils import atomic_write_json, atomic_write_text, read_json_artifact
+from package_utils import atomic_write_json, atomic_write_text, read_json_artifact, validate_output_profile_contract
 
 
 def load_storyboard(path: str) -> dict:
@@ -82,6 +82,7 @@ def generate_assembly_manifest(storyboard: dict) -> dict:
     """Generate assembly instructions for the video editor."""
     scenes_manifest = []
     cumulative_time = 0.0
+    profile = validate_output_profile_contract(storyboard, "storyboard")
 
     for scene in storyboard.get('scenes', []):
         sn = scene['scene_number']
@@ -103,6 +104,8 @@ def generate_assembly_manifest(storyboard: dict) -> dict:
 
     return {
         'title': storyboard.get('title', 'Untitled'),
+        'output_profile': profile['output_profile'],
+        'aspect_ratio': profile['aspect_ratio'],
         'total_duration': round(cumulative_time, 2),
         'scenes': scenes_manifest,
         'assets': {
@@ -111,7 +114,8 @@ def generate_assembly_manifest(storyboard: dict) -> dict:
             'captions': 'captions.srt',
         },
         'export': {
-            'resolution': '1920x1080',
+            'resolution': profile['resolution'],
+            'aspect_ratio': profile['aspect_ratio'],
             'fps': 30,
             'codec': 'h264',
             'format': 'mp4',

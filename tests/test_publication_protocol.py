@@ -42,7 +42,7 @@ class LeaseBoundPublicationTests(unittest.TestCase):
             callback_called.append(True)
             os.replace(temporary, final)
 
-        with self.assertRaises(job_store.LeaseLost):
+        with self.assertRaises(job_store.InvalidStoreState):
             job_store.publish_final_media(
                 "publication-job",
                 "worker-a",
@@ -55,6 +55,31 @@ class LeaseBoundPublicationTests(unittest.TestCase):
         self.assertFalse(callback_called)
         self.assertTrue(temporary.exists())
         self.assertFalse(final.exists())
+
+    def test_publication_requires_rollback_callback_before_callback(self):
+        self.create()
+        claim = job_store.claim_next_job("worker-a", path=self.db)
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        called = []
+
+        def publication():
+            called.append(True)
+
+        with self.assertRaises(job_store.InvalidStoreState):
+            job_store.publish_final_media(
+                "publication-job",
+                "worker-a",
+                claim.job["run_id"],
+                publication=publication,
+                evidence={
+                    "final_video_sha256": "a" * 64,
+                    "final_video_duration_seconds": 4.0,
+                    "final_video_plan_sha256": "a" * 64,
+                },
+                path=self.db,
+            )
+        self.assertEqual(called, [])
 
     def test_publication_callback_runs_inside_barrier_and_commits_evidence_event(self):
         self.create()
@@ -76,6 +101,7 @@ class LeaseBoundPublicationTests(unittest.TestCase):
             "worker-a",
             claim.job["run_id"],
             publication=publication,
+            rollback_publication=lambda: None,
             evidence={
                 "final_video_sha256": "b" * 64,
                 "final_video_duration_seconds": 4.0,
@@ -97,9 +123,12 @@ class LeaseBoundPublicationTests(unittest.TestCase):
 
     def test_stale_failure_finalization_does_not_publish_manifest(self):
         self.create()
-        claim = job_store.claim_next_job("worker-a", now=100.0, lease_seconds=10, path=self.db)
+        claim = job_store.claim_next_job("worker-a", lease_seconds=10, path=self.db)
         self.assertIsNotNone(claim)
         assert claim is not None
+        with job_store.connect(self.db) as connection:
+            connection.execute("UPDATE jobs SET lease_expires_at=0 WHERE id='publication-job'")
+            connection.commit()
         manifest = Path(self.tmp.name) / "package_manifest.json"
 
         def publish(_job):
@@ -251,7 +280,12 @@ class LeaseBoundPublicationTests(unittest.TestCase):
                 "worker-a",
                 claim.job["run_id"],
                 publication=publication,
-                evidence={"final_video_sha256": "d" * 64},
+                rollback_publication=lambda: None,
+                evidence={
+                    "final_video_sha256": "d" * 64,
+                    "final_video_duration_seconds": 4.0,
+                    "final_video_plan_sha256": "d" * 64,
+                },
                 path=self.db,
             )
         job = job_store.get_job("publication-job", self.db)
@@ -272,13 +306,21 @@ class LeaseBoundPublicationTests(unittest.TestCase):
             os.replace(temporary, final)
             time.sleep(1.1)
 
+        def rollback():
+            os.replace(final, temporary)
+
         with self.assertRaises(job_store.LeaseLost):
             job_store.publish_final_media(
                 "publication-job",
                 "worker-a",
                 claim.job["run_id"],
                 publication=publication,
-                evidence={"final_video_sha256": "e" * 64},
+                rollback_publication=rollback,
+                evidence={
+                    "final_video_sha256": "e" * 64,
+                    "final_video_duration_seconds": 4.0,
+                    "final_video_plan_sha256": "e" * 64,
+                },
                 path=self.db,
             )
 
@@ -288,7 +330,8 @@ class LeaseBoundPublicationTests(unittest.TestCase):
         self.assertEqual(job["status"], "failed")
         self.assertEqual(job["error_code"], "publication_reconciliation_required")
         self.assertNotIn("final_video_sha256", job)
-        self.assertTrue(final.exists())
+        self.assertFalse(final.exists())
+        self.assertTrue(temporary.exists())
 
     def test_rename_success_then_error_is_compensated_when_unpublish_succeeds(self):
         self.create()
@@ -313,7 +356,11 @@ class LeaseBoundPublicationTests(unittest.TestCase):
                 claim.job["run_id"],
                 publication=publication,
                 rollback_publication=unpublish,
-                evidence={"final_video_sha256": "f" * 64},
+                evidence={
+                    "final_video_sha256": "f" * 64,
+                    "final_video_duration_seconds": 4.0,
+                    "final_video_plan_sha256": "f" * 64,
+                },
                 path=self.db,
             )
 
@@ -357,7 +404,7 @@ class LeaseBoundPublicationTests(unittest.TestCase):
         self.assertIsNone(job["next_attempt_at"])
         self.assertTrue(manifest.exists())
 
-    def test_verified_inode_rejects_replacement_immediately_after_rename(self):
+    def test_verified_inode_rejects_replacement_and_cleans_destination(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source_dir = root / "private"
@@ -383,21 +430,24 @@ class LeaseBoundPublicationTests(unittest.TestCase):
                     verified_descriptor=source_fd,
                     verified_inode=(source_stat.st_dev, source_stat.st_ino),
                 )
+                original_link = os.link
                 original_replace = os.replace
 
-                def replace_then_swap(src, dst, **kwargs):
-                    original_replace(src, dst, **kwargs)
+                def link_then_swap(src, dst, **kwargs):
+                    original_link(src, dst, **kwargs)
                     if dst == destination.name and kwargs.get("dst_dir_fd") == destination_dir_fd:
                         original_replace(replacement, destination.name, dst_dir_fd=destination_dir_fd)
 
-                with patch("media_assembly.os.replace", side_effect=replace_then_swap):
+                with patch("media_assembly.os.link", side_effect=link_then_swap):
                     with self.assertRaises(media_assembly.MediaError):
                         media_assembly.publish_verified_output(request)
             finally:
                 os.close(destination_dir_fd)
                 os.close(source_dir_fd)
                 os.close(source_fd)
-            self.assertEqual(destination.read_bytes(), b"replacement-media")
+            # The replacement is never allowed to remain canonical after a
+            # failed publication; the canonical name must be absent.
+            self.assertFalse(destination.exists())
             self.assertFalse(source.exists())
 
     def test_final_evidence_uses_verified_descriptor_not_post_publication_path(self):
@@ -432,7 +482,7 @@ class LeaseBoundPublicationTests(unittest.TestCase):
                 return original_open(*args, **kwargs)
 
             with patch("media_assembly.verify_mp4", side_effect=fake_verify), patch(
-                "media_assembly.subprocess.run", side_effect=fake_run
+                "media_assembly._run_bounded_subprocess", side_effect=fake_run
             ), patch("media_assembly.os.open", side_effect=reject_post_publication_open):
                 result = media_assembly.assemble_verified_clips(
                     [clip], output, publication_callback=publication

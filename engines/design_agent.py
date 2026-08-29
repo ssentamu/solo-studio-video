@@ -7,7 +7,7 @@ Output: visuals/ directory with generated images
 import json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from package_utils import atomic_write_json, read_json_artifact
+from package_utils import atomic_write_json, read_json_artifact, validate_output_profile_contract
 
 
 def load_storyboard(path: str) -> dict:
@@ -18,6 +18,7 @@ def generate_visual_prompts(storyboard: dict, visual_style: str = "") -> list[di
     """Generate image prompts for each scene that needs a visual asset."""
     prompts = []
     scenes = storyboard.get('scenes', [])
+    profile = validate_output_profile_contract(storyboard, "storyboard")
 
     for scene in scenes:
         visual = scene['visual_description']
@@ -28,7 +29,7 @@ def generate_visual_prompts(storyboard: dict, visual_style: str = "") -> list[di
             f"A professional video scene: {visual}. "
             f"Camera: {camera}. "
             f"Style: {visual_style}. "
-            f"High production quality, cinematic lighting, 16:9 aspect ratio. "
+            f"High production quality, cinematic lighting, {profile['aspect_ratio']} aspect ratio. "
             f"No text overlay in the image itself. Clean composition."
         )
 
@@ -37,6 +38,8 @@ def generate_visual_prompts(storyboard: dict, visual_style: str = "") -> list[di
             'prompt': prompt,
             'filename': f"scene_{scene['scene_number']:02d}.png",
             'description': visual,
+            'output_profile': profile['output_profile'],
+            'aspect_ratio': profile['aspect_ratio'],
         })
 
     return prompts
@@ -44,8 +47,11 @@ def generate_visual_prompts(storyboard: dict, visual_style: str = "") -> list[di
 
 def write_prompts_manifest(prompts: list[dict], output_dir: Path) -> Path:
     """Write the prompts manifest that the pipeline reads for image generation."""
+    first = prompts[0] if prompts else {}
     manifest = {
         'total_scenes': len(prompts),
+        'output_profile': first.get('output_profile', 'landscape'),
+        'aspect_ratio': first.get('aspect_ratio', '16:9'),
         'prompts': prompts,
     }
     path = output_dir / "visual_prompts.json"
@@ -58,6 +64,7 @@ def generate_thumbnail_prompt(storyboard: dict, brief: dict) -> dict:
     topic = brief.get('topic', storyboard.get('title', ''))
     tone = brief.get('tone', 'professional')
     duration = storyboard.get('total_duration', 60)
+    profile = validate_output_profile_contract(storyboard, "storyboard")
 
     hooks = {
         'educational': f"The TRUTH About {topic[:35]}",
@@ -72,7 +79,7 @@ def generate_thumbnail_prompt(storyboard: dict, brief: dict) -> dict:
         f"YouTube thumbnail for '{topic[:60]}'. "
         f"Bold text: '{title_overlay}'. "
         f"Style: {brief.get('visual_style', 'professional')}. "
-        f"High contrast, vibrant, strong focal point. 4K, 16:9. "
+        f"High contrast, vibrant, strong focal point. 4K, {profile['aspect_ratio']}. "
         f"Maximum 4 words visible. Clean, clickable composition."
     )
     return {'title_overlay': title_overlay, 'prompt': prompt, 'filename': 'youtube_thumbnail.png'}

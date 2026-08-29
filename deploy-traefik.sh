@@ -8,11 +8,68 @@ APP_DIR=/docker/hermes-agent-r0tv/data/solo-studio-video
 APP_NAME=solo-studio-video
 DOMAIN=https://edgescout.tech/video
 PUBLIC_JOBS_URL=https://edgescout.tech/video/api/jobs?limit=1
-: "${SOLO_STUDIO_API_TOKEN:?Set SOLO_STUDIO_API_TOKEN in the shell before deploying Solo Studio Video}"
+SOLO_STUDIO_API_TOKEN_FILE=${SOLO_STUDIO_API_TOKEN_FILE:-$HOME/.config/solo-studio-video/api_token}
+SOLO_STUDIO_API_TOKEN_EPHEMERAL=0
+SOLO_STUDIO_API_TOKEN_TEMP_DIR=""
+
+cleanup_ephemeral_api_token() {
+  if [ "$SOLO_STUDIO_API_TOKEN_EPHEMERAL" = "1" ] && [ -n "$SOLO_STUDIO_API_TOKEN_FILE" ]; then
+    rm -f -- "$SOLO_STUDIO_API_TOKEN_FILE" 2>/dev/null || true
+  fi
+  if [ "$SOLO_STUDIO_API_TOKEN_EPHEMERAL" = "1" ] && [ -n "$SOLO_STUDIO_API_TOKEN_TEMP_DIR" ]; then
+    rm -rf -- "$SOLO_STUDIO_API_TOKEN_TEMP_DIR" 2>/dev/null || true
+  fi
+}
+trap cleanup_ephemeral_api_token EXIT
+
+if [ ! -e "$SOLO_STUDIO_API_TOKEN_FILE" ] && [ -n "${SOLO_STUDIO_API_TOKEN:-}" ]; then
+  fallback_token_dir="${TMPDIR:-/tmp}/solo-studio-video-token.${BASHPID}.${RANDOM}"
+  if ! (umask 077 && mkdir -- "$fallback_token_dir"); then
+    echo "Could not create a private temporary directory for the API token." >&2
+    exit 1
+  fi
+  SOLO_STUDIO_API_TOKEN_TEMP_DIR="$fallback_token_dir"
+  SOLO_STUDIO_API_TOKEN_EPHEMERAL=1
+  fallback_token_template="$fallback_token_dir/token.XXXXXX"
+  if SOLO_STUDIO_API_TOKEN_FILE=$(mktemp "$fallback_token_template"); then
+    :
+  else
+    token_create_status=$?
+    echo "Could not create the temporary API token file." >&2
+    exit "$token_create_status"
+  fi
+  chmod 600 "$SOLO_STUDIO_API_TOKEN_FILE"
+  printf '%s\n' "$SOLO_STUDIO_API_TOKEN" > "$SOLO_STUDIO_API_TOKEN_FILE"
+fi
+if [ -L "$SOLO_STUDIO_API_TOKEN_FILE" ] || [ ! -f "$SOLO_STUDIO_API_TOKEN_FILE" ] || [ ! -r "$SOLO_STUDIO_API_TOKEN_FILE" ]; then
+  echo "SOLO_STUDIO_API_TOKEN_FILE must be an existing readable regular file (not a symlink)." >&2
+  exit 1
+fi
+if [ "$SOLO_STUDIO_API_TOKEN_EPHEMERAL" = "0" ]; then
+  secret_parent=$(dirname -- "$SOLO_STUDIO_API_TOKEN_FILE")
+  if [ ! -d "$secret_parent" ]; then
+    echo "SOLO_STUDIO_API_TOKEN_FILE parent directory must exist." >&2
+    exit 1
+  fi
+  secret_parent_mode=$(stat -c '%a' "$secret_parent")
+  secret_parent_owner=$(stat -c '%u' "$secret_parent")
+  if (( (8#$secret_parent_mode & 077) != 0 )) || [ "$secret_parent_owner" != "$(id -u)" ]; then
+    echo "SOLO_STUDIO_API_TOKEN_FILE parent directory must be owned by the deploying user and private." >&2
+    exit 1
+  fi
+fi
+secret_mode=$(stat -c '%a' "$SOLO_STUDIO_API_TOKEN_FILE")
+if (( (8#$secret_mode & 077) != 0 )); then
+  echo "SOLO_STUDIO_API_TOKEN_FILE must not be readable by group or other users." >&2
+  exit 1
+fi
+SOLO_STUDIO_API_TOKEN_MOUNT=(
+  --mount "type=bind,src=$SOLO_STUDIO_API_TOKEN_FILE,dst=/run/secrets/solo_studio_api_token,ro"
+)
 SOLO_STUDIO_CORS_ORIGINS=${SOLO_STUDIO_CORS_ORIGINS:-https://edgescout.tech}
 SOLO_STUDIO_ENABLE_HIGGSFIELD=${SOLO_STUDIO_ENABLE_HIGGSFIELD:-0}
 SOLO_STUDIO_HIGGSFIELD_MODEL=${SOLO_STUDIO_HIGGSFIELD_MODEL:-seedance_2_0}
-SOLO_STUDIO_HIGGSFIELD_RESOLUTION=${SOLO_STUDIO_HIGGSFIELD_RESOLUTION:-720p}
+SOLO_STUDIO_HIGGSFIELD_RESOLUTION=${SOLO_STUDIO_HIGGSFIELD_RESOLUTION:-1080p}
 SOLO_STUDIO_HIGGSFIELD_TIMEOUT=${SOLO_STUDIO_HIGGSFIELD_TIMEOUT:-900}
 SOLO_STUDIO_CURL_CONNECT_TIMEOUT=${SOLO_STUDIO_CURL_CONNECT_TIMEOUT:-5}
 SOLO_STUDIO_CURL_MAX_TIME=${SOLO_STUDIO_CURL_MAX_TIME:-15}
@@ -27,6 +84,7 @@ CONTAINER_USER_ARGS=()
 release_tag=""
 rollback_tag=""
 curl_config=""
+curl_config_dir=""
 container_replaced=0
 removal_started=0
 removal_confirmed=0
@@ -54,8 +112,17 @@ if [ "$SOLO_STUDIO_ENABLE_HIGGSFIELD" = "1" ]; then
 fi
 
 cleanup() {
+  if [ "$SOLO_STUDIO_API_TOKEN_EPHEMERAL" = "1" ] && [ -n "$SOLO_STUDIO_API_TOKEN_FILE" ]; then
+    rm -f -- "$SOLO_STUDIO_API_TOKEN_FILE" 2>/dev/null || true
+  fi
+  if [ "$SOLO_STUDIO_API_TOKEN_EPHEMERAL" = "1" ] && [ -n "$SOLO_STUDIO_API_TOKEN_TEMP_DIR" ]; then
+    rm -rf -- "$SOLO_STUDIO_API_TOKEN_TEMP_DIR" 2>/dev/null || true
+  fi
   if [ -n "$curl_config" ]; then
     rm -f "$curl_config"
+  fi
+  if [ -n "$curl_config_dir" ]; then
+    rmdir "$curl_config_dir" 2>/dev/null || true
   fi
   if [ "$PREFLIGHT_DIRS_SAFE_TO_DELETE" = "1" ]; then
     if [ -n "$PREFLIGHT_STATE_DIR" ]; then
@@ -287,7 +354,7 @@ run_container() {
     --restart unless-stopped \
     "${DOCKER_RESOURCE_ARGS[@]}" \
     "${CONTAINER_USER_ARGS[@]}" \
-    -e SOLO_STUDIO_API_TOKEN \
+    -e SOLO_STUDIO_API_TOKEN_FILE=/run/secrets/solo_studio_api_token \
     -e SOLO_STUDIO_JOBS_FILE=/app/state/jobs.json \
     -e SOLO_STUDIO_DATABASE_FILE=/app/state/solo_studio.sqlite3 \
     -e SOLO_STUDIO_REQUIRE_API_TOKEN=1 \
@@ -300,6 +367,7 @@ run_container() {
     -e SOLO_STUDIO_HIGGSFIELD_RESOLUTION="$SOLO_STUDIO_HIGGSFIELD_RESOLUTION" \
     -e SOLO_STUDIO_HIGGSFIELD_TIMEOUT="$SOLO_STUDIO_HIGGSFIELD_TIMEOUT" \
     "${HIGGSFIELD_CREDENTIALS_MOUNT[@]}" \
+    "${SOLO_STUDIO_API_TOKEN_MOUNT[@]}" \
     -v "$APP_DIR/output:/app/output" \
     -v "$APP_DIR/state:/app/state" \
     -l "traefik.enable=true" \
@@ -322,7 +390,7 @@ run_container_preflight() {
     --network none \
     "${DOCKER_RESOURCE_ARGS[@]}" \
     "${CONTAINER_USER_ARGS[@]}" \
-    -e SOLO_STUDIO_API_TOKEN \
+    -e SOLO_STUDIO_API_TOKEN_FILE=/run/secrets/solo_studio_api_token \
     -e SOLO_STUDIO_JOBS_FILE=/app/state/jobs.json \
     -e SOLO_STUDIO_DATABASE_FILE=/app/state/solo_studio.sqlite3 \
     -e SOLO_STUDIO_REQUIRE_API_TOKEN=1 \
@@ -339,6 +407,7 @@ run_container_preflight() {
     -v "${PREFLIGHT_OUTPUT_DIR:-$APP_DIR/output}:/app/output" \
     -v "${PREFLIGHT_STATE_DIR:-$APP_DIR/state}:/app/state" \
     "${HIGGSFIELD_CREDENTIALS_MOUNT[@]}" \
+    "${SOLO_STUDIO_API_TOKEN_MOUNT[@]}" \
     "$image_tag"
 }
 
@@ -429,7 +498,10 @@ preflight_image() {
       test "$(curl -sS --max-time 3 -o /dev/null -w "%{http_code}" http://127.0.0.1:9091/api/health)" = "200"
       test "$(curl -sS --max-time 3 -o /dev/null -w "%{http_code}" http://127.0.0.1:9091/api/templates)" = "200"
       test "$(curl -sS --max-time 3 -o /dev/null -w "%{http_code}" http://127.0.0.1:9091/api/jobs?limit=1)" = "401"
-      test "$(curl -sS --max-time 3 -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $SOLO_STUDIO_API_TOKEN" http://127.0.0.1:9091/api/jobs?limit=1)" = "200"
+      token_config_dir=$(mktemp -d); chmod 700 "$token_config_dir"; token_config="$token_config_dir/config"
+      TOKEN_CONFIG="$token_config" python -c "import api, os, pathlib, sys; token = api._read_secure_text_file(pathlib.Path(\"/run/secrets/solo_studio_api_token\"), 4096); token = token[:-1] if token.endswith(\"\\n\") else token; invalid = (not token) or any(ord(character) < 0x20 or ord(character) == 0x7F or ord(character) in (34, 92) for character in token); sys.exit(\"invalid token\") if invalid else None; config = (\"header = \" + chr(34) + \"Authorization: Bearer \" + token + chr(34) + chr(10)).encode(\"utf-8\"); config_fd = os.open(os.environ[\"TOKEN_CONFIG\"], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600); written = os.write(config_fd, config); os.fsync(config_fd); os.close(config_fd); sys.exit(\"short curl config write\") if written != len(config) else None"
+      test "$(curl -sS --max-time 3 -o /dev/null -w "%{http_code}" --config "$token_config" http://127.0.0.1:9091/api/jobs?limit=1)" = "200"
+      rm -rf "$token_config_dir"
     '; then
       healthy=1
       break
@@ -659,6 +731,9 @@ fi
 chmod 660 "$APP_DIR/state/jobs.json"
 if [ "$(id -u)" = "0" ]; then
   chown -R 10001:10001 "$APP_DIR/state" "$APP_DIR/output"
+  if [ "$SOLO_STUDIO_API_TOKEN_EPHEMERAL" = "1" ]; then
+    chown 10001:10001 "$SOLO_STUDIO_API_TOKEN_FILE"
+  fi
   CONTAINER_USER_ARGS=(--user 10001:10001)
   runtime_uid=10001
   runtime_gid=10001
@@ -670,6 +745,11 @@ else
     echo "Current host identity $(id -u):$(id -g) cannot write the state/output bind mounts." >&2
     exit 1
   fi
+fi
+
+if [ "$(stat -c '%u' "$SOLO_STUDIO_API_TOKEN_FILE")" != "$runtime_uid" ]; then
+  echo "SOLO_STUDIO_API_TOKEN_FILE must be owned by the selected container UID ($runtime_uid)." >&2
+  exit 1
 fi
 
 if [ "$SOLO_STUDIO_ENABLE_HIGGSFIELD" = "1" ]; then
@@ -698,9 +778,37 @@ fi
 
 preflight_release_image
 
-curl_config=$(mktemp)
-chmod 600 "$curl_config"
-printf '%s\n' "header = \"Authorization: Bearer $SOLO_STUDIO_API_TOKEN\"" > "$curl_config"
+curl_config_dir=$(mktemp -d)
+chmod 700 "$curl_config_dir"
+curl_config="$curl_config_dir/config"
+if ! python3 -c 'import os, pathlib, stat, sys
+token_fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+try:
+    token_stat = os.fstat(token_fd)
+    if not stat.S_ISREG(token_stat.st_mode) or token_stat.st_uid != int(sys.argv[3]) or token_stat.st_mode & 0o77:
+        raise SystemExit("invalid API token file metadata")
+    token = os.read(token_fd, 4097).decode("utf-8")
+finally:
+    os.close(token_fd)
+if len(token) > 4096:
+    raise SystemExit("API token is too long")
+if token.endswith("\n"):
+    token = token[:-1]
+if not token or any(ord(character) < 0x20 or ord(character) == 0x7F or ord(character) in (34, 92) for character in token):
+    raise SystemExit("invalid API token file contents")
+config = ("header = " + chr(34) + "Authorization: Bearer " + token + chr(34) + chr(10)).encode("utf-8")
+config_fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+try:
+    written = os.write(config_fd, config)
+    if written != len(config):
+        raise SystemExit("short curl config write")
+    os.fsync(config_fd)
+finally:
+    os.close(config_fd)' \
+  "$SOLO_STUDIO_API_TOKEN_FILE" "$curl_config" "$runtime_uid"; then
+  echo "Could not create the authenticated curl configuration from SOLO_STUDIO_API_TOKEN_FILE." >&2
+  exit 1
+fi
 
 echo ""
 echo "=== Deploying on edgescout.tech/video ==="

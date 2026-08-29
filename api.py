@@ -7,6 +7,7 @@ GET    /api/jobs/{id}/download  Download final package (zip)
 GET    /api/jobs          List recent jobs
 """
 import ipaddress
+import hashlib
 import io
 import json
 import math
@@ -19,7 +20,7 @@ import uuid
 import zipfile
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import yaml
@@ -34,31 +35,67 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
-from package_utils import LEGACY_FLAT_RUN_ID, atomic_write_text, compute_package_status, read_json_object, resolve_current_attempt_output_dir, update_json_file, write_package_manifest
+from package_utils import LEGACY_FLAT_RUN_ID, _open_regular_descriptor, _read_secure_text_file, atomic_write_text, compute_package_status, normalize_output_profile, read_json_artifact, read_json_object, read_text_artifact, resolve_current_attempt_output_dir, update_json_file, validate_output_profile_contract, write_package_manifest
+
+
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(minimum, min(maximum, value))
 
 
 # ── Config — auto-detect base dir (works in Docker and local) ──
 APP_DIR = Path(__file__).resolve().parent
-OUTPUT_ROOT = APP_DIR / "output"
-MAX_DOWNLOAD_BYTES = int(os.getenv("SOLO_STUDIO_MAX_DOWNLOAD_BYTES", str(512 * 1024 * 1024)))
+MAX_DOWNLOAD_BYTES = _bounded_int_env("SOLO_STUDIO_MAX_DOWNLOAD_BYTES", 512 * 1024 * 1024, 1, 2 * 1024 * 1024 * 1024)
 DEFAULT_JOBS_FILE = Path(os.getenv("SOLO_STUDIO_JOBS_FILE", str(APP_DIR / "jobs.json")))
 JOBS_FILE = DEFAULT_JOBS_FILE
 DATABASE_FILE = Path(os.getenv("SOLO_STUDIO_DATABASE_FILE", str(APP_DIR / "state" / "solo_studio.sqlite3")))
 DATABASE_CONFIGURED = bool(os.getenv("SOLO_STUDIO_DATABASE_FILE", "").strip())
+OUTPUT_ROOT = job_store._output_root_for_database(DATABASE_FILE) if DATABASE_CONFIGURED else APP_DIR / "output"
 AUTH_DB_ENABLED = DATABASE_CONFIGURED
 FRONTEND_DIR = APP_DIR / "frontend"
-API_TOKEN = os.getenv("SOLO_STUDIO_API_TOKEN", "").strip()
+API_TOKEN_FILE = Path(os.getenv("SOLO_STUDIO_API_TOKEN_FILE", "").strip()) if os.getenv("SOLO_STUDIO_API_TOKEN_FILE", "").strip() else None
+
+
+def _valid_token_value(value: str) -> bool:
+    return bool(value) and all(
+        not character.isspace()
+        and (ord(character) >= 0x20)
+        and ord(character) != 0x7F
+        and character not in {'"', "\\"}
+        for character in value
+    )
+
+
+def _load_api_token() -> str:
+    if API_TOKEN_FILE is None:
+        value = os.getenv("SOLO_STUDIO_API_TOKEN", "")
+        return value if _valid_token_value(value) else ""
+    try:
+        value = _read_secure_text_file(API_TOKEN_FILE, 4096)
+    except (OSError, UnicodeDecodeError):
+        return ""
+    if value.endswith("\n"):
+        value = value[:-1]
+    if not _valid_token_value(value):
+        return ""
+    return value
+
+
+API_TOKEN = _load_api_token()
 TOKEN_IDENTITIES_FILE = Path(os.getenv("SOLO_STUDIO_TOKEN_IDENTITIES_FILE", "").strip()) if os.getenv("SOLO_STUDIO_TOKEN_IDENTITIES_FILE", "").strip() else None
 REQUIRE_API_TOKEN = os.getenv("SOLO_STUDIO_REQUIRE_API_TOKEN", "").strip().lower() in {"1", "true", "yes"}
 SESSION_COOKIE_NAME = "solo_studio_session"
 SESSION_COOKIE_PATH = os.getenv("SOLO_STUDIO_SESSION_COOKIE_PATH", "/")
-SESSION_MAX_AGE = int(os.getenv("SOLO_STUDIO_SESSION_MAX_AGE", "3600"))
+SESSION_MAX_AGE = _bounded_int_env("SOLO_STUDIO_SESSION_MAX_AGE", 3600, 1, 7 * 24 * 60 * 60)
 COOKIE_SECURE = os.getenv("SOLO_STUDIO_COOKIE_SECURE", "1" if (REQUIRE_API_TOKEN or API_TOKEN) else "0").strip().lower() not in {"0", "false", "no"}
 SESSION_TOKENS: dict[str, float] = {}
 SESSION_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
-SESSION_LOGIN_WINDOW = int(os.getenv("SOLO_STUDIO_SESSION_LOGIN_WINDOW", "300"))
-SESSION_LOGIN_MAX_ATTEMPTS = int(os.getenv("SOLO_STUDIO_SESSION_LOGIN_MAX_ATTEMPTS", "10"))
-SESSION_LOGIN_MAX_KEYS = int(os.getenv("SOLO_STUDIO_SESSION_LOGIN_MAX_KEYS", "10000"))
+SESSION_LOGIN_WINDOW = _bounded_int_env("SOLO_STUDIO_SESSION_LOGIN_WINDOW", 300, 1, 24 * 60 * 60)
+SESSION_LOGIN_MAX_ATTEMPTS = _bounded_int_env("SOLO_STUDIO_SESSION_LOGIN_MAX_ATTEMPTS", 10, 1, 1000)
+SESSION_LOGIN_MAX_KEYS = _bounded_int_env("SOLO_STUDIO_SESSION_LOGIN_MAX_KEYS", 10000, 1, 1_000_000)
 TRUST_PROXY_HEADERS = os.getenv("SOLO_STUDIO_TRUST_PROXY_HEADERS", "0").strip().lower() in {"1", "true", "yes"}
 TRUSTED_PROXY_NETWORKS = tuple(
     ipaddress.ip_network(value.strip(), strict=False)
@@ -130,6 +167,7 @@ class BriefRequest(BaseModel):
     key_messages: list[str] = Field(default_factory=list, max_length=20)
     visual_style: str = Field(default="", max_length=2000)
     call_to_action: str = Field(default="", max_length=1000)
+    output_profile: str = Field(default="landscape", max_length=32)
 
 
 class OperatorSessionRequest(BaseModel):
@@ -144,6 +182,8 @@ class JobStatus(BaseModel):
     progress: float = 0.0  # 0.0 to 1.0
     stage: str = "waiting"
     format: str = ""
+    output_profile: str = "landscape"
+    aspect_ratio: str = "16:9"
     chapters: int = 0
     scenes: int = 0
     duration_seconds: float = 0
@@ -164,6 +204,7 @@ class JobStatus(BaseModel):
     artifact_summary: dict = Field(default_factory=dict)
     verified_clips: int = 0
     expected_scenes: int = 0
+    stages: list[dict] = Field(default_factory=list)
 
 
 def _header_token(authorization: str | None, x_solo_studio_token: str | None) -> str:
@@ -176,18 +217,28 @@ def _header_token(authorization: str | None, x_solo_studio_token: str | None) ->
 
 
 def _token_owner(token: str) -> str | None:
+    if not _valid_token_value(token):
+        return None
     if API_TOKEN and secrets.compare_digest(token, API_TOKEN):
         return job_store.DEFAULT_OWNER_ID
     if TOKEN_IDENTITIES_FILE is None or not token:
         return None
     try:
-        identities = json.loads(TOKEN_IDENTITIES_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        identities = job_store._load_json(
+            _read_secure_text_file(TOKEN_IDENTITIES_FILE, 1024 * 1024),
+            label="token identities",
+        )
+    except (OSError, UnicodeDecodeError, ValueError, job_store.JobStoreError):
         return None
     if not isinstance(identities, dict):
         return None
     for owner_id, configured in identities.items():
-        if isinstance(owner_id, str) and isinstance(configured, str) and secrets.compare_digest(token, configured):
+        if (
+            isinstance(owner_id, str)
+            and isinstance(configured, str)
+            and _valid_token_value(configured)
+            and secrets.compare_digest(token, configured)
+        ):
             return owner_id[:128] or None
     return None
 
@@ -302,7 +353,7 @@ def require_api_token(
     solo_studio_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
 ) -> None:
     """Protect job routes with a header token or durable HttpOnly session."""
-    if not API_TOKEN and TOKEN_IDENTITIES_FILE is None:
+    if not API_TOKEN and TOKEN_IDENTITIES_FILE is None and not REQUIRE_API_TOKEN and API_TOKEN_FILE is None:
         _set_authenticated_owner(request, job_store.DEFAULT_OWNER_ID)
         return
     if not _csrf_origin_allowed(request, require_header=bool(solo_studio_session)):
@@ -425,7 +476,7 @@ def _uses_legacy_json_store() -> bool:
 
 def _load_jobs(*, limit: int = 50, owner_id: str | None = None) -> dict:
     if _uses_legacy_json_store():
-        return read_json_object(JOBS_FILE)
+        return read_json_object(JOBS_FILE, lock=False)
     return {
         job["id"]: job
         for job in job_store.list_jobs(limit=limit, owner_id=owner_id, path=DATABASE_FILE)
@@ -442,6 +493,8 @@ def _validate_job_records(jobs: dict) -> dict:
         embedded_id = job.get("id")
         if not isinstance(embedded_id, str) or embedded_id != key or job_store._validate_job_id(embedded_id) != key_id:
             raise ValueError("legacy jobs store entries must contain a matching id")
+        job_store._validate_legacy_record(key, job, output_root=OUTPUT_ROOT)
+        job.setdefault("topic", "")
     return jobs
 
 
@@ -462,9 +515,10 @@ PUBLIC_JOB_KEYS = frozenset({
     "id", "topic", "target_audience", "duration_seconds", "platform", "tone",
     "key_messages", "visual_style", "call_to_action", "template", "status",
     "progress", "stage", "format", "chapters", "scenes", "created_at",
+    "output_profile", "aspect_ratio",
     "completed_at", "error", "has_visuals", "has_voiceover", "has_clips",
     "has_final_video", "package_status", "artifact_summary", "verified_clips",
-    "expected_scenes",
+    "expected_scenes", "stages",
 })
 
 
@@ -568,6 +622,7 @@ def _mark_job_claimable(job_id: str, owner_id: str) -> dict:
             updated = job_store.update_fields(
                 job_id,
                 {"status": "queued"},
+                owner_id=owner_id,
                 expected_status="initializing",
                 require_not_cancelled=True,
                 path=DATABASE_FILE,
@@ -613,6 +668,7 @@ def _fail_initializing_job(job_id: str, owner_id: str, error: str) -> None:
                     "has_clips": False,
                     "has_final_video": False,
                 },
+                owner_id=owner_id,
                 expected_status="initializing",
                 require_not_cancelled=True,
                 path=DATABASE_FILE,
@@ -672,6 +728,7 @@ def _enrich_job(job: dict) -> dict:
             job.get("attempt") if job.get("run_id") and isinstance(job.get("attempt"), int) else None,
             job.get("run_id"),
             job.get("source_digest") if job.get("run_id") else None,
+            job.get("final_video_duration_seconds"),
         )
         enriched.update({
             "package_status": summary["package_status"],
@@ -722,11 +779,15 @@ def _open_directory_path_no_follow(path: Path) -> int:
         raise
 
 
-def _iter_zip_files_no_follow(root: Path):
+def _iter_zip_files_no_follow(root: Path, expected_root_inode: tuple[int, int] | None = None):
     """Yield ``(archive_name, fd, size)`` without path check/open races."""
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     root_fd = _open_directory_path_no_follow(root)
+    root_stat = os.fstat(root_fd)
+    if expected_root_inode is not None and (root_stat.st_dev, root_stat.st_ino) != expected_root_inode:
+        os.close(root_fd)
+        raise OSError("artifact root changed during download")
 
     def walk(directory_fd: int, prefix: str):
         try:
@@ -739,6 +800,10 @@ def _iter_zip_files_no_follow(root: Path):
                         or entry.name.endswith(".part")
                         or ".partial" in entry.name
                         or entry.name.endswith(".tmp")
+                        or entry.name.startswith(".staging-")
+                        or entry.name.startswith(".clips.generation-")
+                        or entry.name.startswith(".clips.previous-")
+                        or entry.name.startswith(".recovered-")
                     ):
                         continue
                     if entry.is_symlink():
@@ -768,6 +833,36 @@ def _iter_zip_files_no_follow(root: Path):
         os.close(root_fd)
 
 
+def _snapshot_zip_hashes(root: Path, expected_root_inode: tuple[int, int]) -> tuple[dict[str, str], int]:
+    """Hash every archive entry from descriptor-bound files before packaging."""
+    hashes: dict[str, str] = {}
+    total_bytes = 0
+    for arcname, descriptor, size in _iter_zip_files_no_follow(root, expected_root_inode):
+        try:
+            if size > MAX_DOWNLOAD_BYTES - total_bytes:
+                raise HTTPException(status_code=413, detail="Job package exceeds the configured download limit")
+            digest = hashlib.sha256()
+            bytes_read = 0
+            while True:
+                remaining = MAX_DOWNLOAD_BYTES - total_bytes - bytes_read
+                if remaining < 0:
+                    raise HTTPException(status_code=413, detail="Job package exceeds the configured download limit")
+                chunk = os.read(descriptor, min(1024 * 1024, remaining + 1))
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                if bytes_read > size or bytes_read > MAX_DOWNLOAD_BYTES - total_bytes:
+                    raise HTTPException(status_code=409, detail="Job package changed during download")
+                digest.update(chunk)
+            if bytes_read != size:
+                raise HTTPException(status_code=409, detail="Job package changed during download")
+            total_bytes += bytes_read
+            hashes[arcname] = digest.hexdigest()
+        finally:
+            os.close(descriptor)
+    return hashes, total_bytes
+
+
 # ── Routes ──
 @app.get("/api/health")
 async def health():
@@ -789,7 +884,7 @@ async def diagnostics():
             queue = job_store.queue_snapshot(path=DATABASE_FILE)
             database = {"backend": "sqlite", "path": str(DATABASE_FILE), "ok": True}
         else:
-            jobs = _validate_job_records(read_json_object(JOBS_FILE))
+            jobs = _validate_job_records(read_json_object(JOBS_FILE, lock=False))
             counts: dict[str, int] = {}
             for job in jobs.values():
                 status = str(job.get("status", "unknown"))
@@ -840,6 +935,7 @@ async def create_job(
     # Convert minutes to seconds
     try:
         duration_seconds = _duration_minutes_to_seconds(brief.duration_minutes)
+        output_profile = normalize_output_profile(brief.output_profile)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -857,6 +953,8 @@ async def create_job(
         "progress": 0.0,
         "stage": "waiting",
         "format": "",
+        "output_profile": output_profile["output_profile"],
+        "aspect_ratio": output_profile["aspect_ratio"],
         "chapters": 0,
         "scenes": 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -891,6 +989,16 @@ async def create_job(
     return JSONResponse(content=_public_job_response(enriched), status_code=201 if created else 200)
 
 
+def _load_templates_file(templates_path: Path) -> list[dict[str, Any]]:
+    try:
+        payload = job_store._load_json(read_text_artifact(templates_path), label="templates")
+    except (OSError, job_store.InvalidStoreState) as exc:
+        raise HTTPException(status_code=503, detail="Templates store is invalid and requires repair.") from exc
+    if not isinstance(payload, list) or any(not isinstance(template, dict) for template in payload):
+        raise HTTPException(status_code=503, detail="Templates store is invalid and requires repair.")
+    return payload
+
+
 @app.get("/api/templates")
 async def list_templates():
     """List available brief templates."""
@@ -899,8 +1007,7 @@ async def list_templates():
         templates_path = Path(__file__).parent / "templates.json"
     if not templates_path.exists():
         return []
-    with open(templates_path) as f:
-        return json.load(f)
+    return _load_templates_file(templates_path)
 
 
 @app.post("/api/jobs/from-template/{template_id}", status_code=201, dependencies=[Depends(require_api_token)])
@@ -914,8 +1021,7 @@ async def create_job_from_template(
     if not templates_path.exists():
         raise HTTPException(status_code=404, detail="No templates available")
 
-    with open(templates_path) as f:
-        templates = json.load(f)
+    templates = _load_templates_file(templates_path)
 
     template = next((t for t in templates if t['id'] == template_id), None)
     if not template:
@@ -924,6 +1030,7 @@ async def create_job_from_template(
     job_id = uuid.uuid4().hex[:12]
     try:
         duration_seconds = _duration_minutes_to_seconds(template.get("duration_minutes", 1.0))
+        output_profile = validate_output_profile_contract(template, "template")
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -942,6 +1049,8 @@ async def create_job_from_template(
         "progress": 0.0,
         "stage": "waiting",
         "format": "",
+        "output_profile": output_profile["output_profile"],
+        "aspect_ratio": output_profile["aspect_ratio"],
         "chapters": 0,
         "scenes": 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -993,7 +1102,7 @@ async def cancel_job(request: Request, job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     if DATABASE_CONFIGURED:
         try:
-            job = job_store.cancel_job(job_id, path=DATABASE_FILE)
+            job = job_store.cancel_job(job_id, owner_id=_owner_id_for_request(request), path=DATABASE_FILE)
         except job_store.JobStoreError as exc:
             raise HTTPException(status_code=503, detail="Job store unavailable") from exc
         if AUTH_DB_ENABLED:
@@ -1001,8 +1110,14 @@ async def cancel_job(request: Request, job_id: str):
     else:
         def apply_cancel(jobs: dict) -> dict:
             current = jobs.get(job_id)
-            if isinstance(current, dict) and current.get("status") not in {"completed", "failed", "cancelled"}:
-                current.update({"status": "cancelled", "error": "cancelled by user", "completed_at": datetime.now(timezone.utc).isoformat()})
+            if isinstance(current, dict) and current.get("status") not in {"completed", "editor_package", "failed", "cancelled"}:
+                mutation_at = datetime.now(timezone.utc).isoformat()
+                current.update({
+                    "status": "cancelled",
+                    "error": "cancelled by user",
+                    "cancelled_at": mutation_at,
+                    "updated_at": mutation_at,
+                })
             return jobs
         job = update_json_file(JOBS_FILE, apply_cancel).get(job_id, existing_job)
     return await run_in_threadpool(_enrich_job, job)
@@ -1014,7 +1129,7 @@ async def download_job(request: Request, job_id: str):
     job = _get_visible_job(request, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job['status'] != 'completed':
+    if job['status'] not in {'completed', 'editor_package'}:
         raise HTTPException(status_code=400, detail="Job not yet completed")
 
     try:
@@ -1025,6 +1140,13 @@ async def download_job(request: Request, job_id: str):
         raise HTTPException(status_code=404, detail="Job output not found")
     if not job_dir.exists() or job_dir.is_symlink():
         raise HTTPException(status_code=404, detail="Job output not found")
+    try:
+        root_stat = os.stat(job_dir, follow_symlinks=False)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise HTTPException(status_code=404, detail="Job output not found")
+        expected_root_inode = (root_stat.st_dev, root_stat.st_ino)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Job output not found") from exc
     root = OUTPUT_ROOT.resolve()
     resolved_job_dir = job_dir.resolve()
     if _uses_legacy_json_store() or job.get("run_id") == LEGACY_FLAT_RUN_ID:
@@ -1039,10 +1161,12 @@ async def download_job(request: Request, job_id: str):
 
     # Create a bounded ZIP from regular files inside the job directory only.
     buf = io.BytesIO()
+    expected_archive_hashes, expected_total_bytes = _snapshot_zip_hashes(job_dir, expected_root_inode)
     total_bytes = 0
+    archive_hashes: dict[str, str] = {}
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         try:
-            for arcname, descriptor, size in _iter_zip_files_no_follow(job_dir):
+            for arcname, descriptor, size in _iter_zip_files_no_follow(job_dir, expected_root_inode):
                 remaining = MAX_DOWNLOAD_BYTES - total_bytes
                 if size > remaining:
                     os.close(descriptor)
@@ -1053,11 +1177,14 @@ async def download_job(request: Request, job_id: str):
                 if len(data) > remaining:
                     raise HTTPException(status_code=413, detail="Job package exceeds the configured download limit")
                 total_bytes += len(data)
+                archive_hashes[arcname] = hashlib.sha256(data).hexdigest()
                 zf.writestr(arcname, data)
         except ValueError as exc:
             raise HTTPException(status_code=500, detail="Unsafe artifact path") from exc
         except OSError as exc:
             raise HTTPException(status_code=500, detail="Artifact could not be safely opened") from exc
+    if archive_hashes != expected_archive_hashes or total_bytes != expected_total_bytes:
+        raise HTTPException(status_code=409, detail="Package artifacts changed during download; retry the download")
     buf.seek(0)
 
     safe_topic = "".join(c for c in job['topic'][:30] if c.isalnum() or c in ' _-').strip()
@@ -1082,6 +1209,8 @@ def _write_brief_yaml(path: Path, job: dict):
         "key_messages": job.get("key_messages", []),
         "visual_style": job.get("visual_style", ""),
         "call_to_action": job.get("call_to_action", ""),
+        "output_profile": job.get("output_profile", "landscape"),
+        "aspect_ratio": job.get("aspect_ratio", "16:9"),
     }
     atomic_write_text(path, yaml.safe_dump(payload, sort_keys=False, allow_unicode=True))
 

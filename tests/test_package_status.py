@@ -7,21 +7,580 @@ import re
 import stat
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
+from typing import Any, cast
 from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from package_utils import _probe_media, atomic_write_json, clear_generated_artifacts, compute_package_status, read_json_object, update_json_file, write_package_manifest
+import package_utils
+
+from package_utils import _generation_plan_info, _probe_media, _public_summary, atomic_write_json, clear_generated_artifacts, compute_package_status, normalize_output_profile, read_json_object, update_json_file, validate_output_profile_contract, write_package_manifest
 from engines.generation_agent import generate_plan, run_higgsfield
+import job_store
+import worker
 
 
 class PackageStatusTests(unittest.TestCase):
-    def test_atomic_json_writes_use_unique_temp_files_for_concurrent_writers(self):
+    def test_claim_identity_rejects_same_inode_ctime_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            victim = root / "victim"
+            victim.write_text("safe", encoding="utf-8")
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                before = victim.stat()
+                expected = package_utils._entry_cleanup_identity_at(parent_fd, victim.name)
+                time.sleep(0.002)
+                os.utime(victim, ns=(before.st_atime_ns, before.st_mtime_ns))
+                self.assertNotEqual(victim.stat().st_ctime_ns, before.st_ctime_ns)
+                with self.assertRaises(OSError):
+                    package_utils._remove_entry_at(parent_fd, victim.name, expected)
+                self.assertTrue(victim.exists())
+            finally:
+                os.close(parent_fd)
+
+    def test_remove_entry_recovers_mutation_during_destructive_unlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            victim = root / "victim"
+            victim.write_text("safe", encoding="utf-8")
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            real_unlink = package_utils.os.unlink
+            try:
+                expected = package_utils._entry_cleanup_identity_at(parent_fd, victim.name)
+
+                def mutate_before_unlink(name, *args, **kwargs):
+                    if name == "entry":
+                        fd = os.open(name, os.O_WRONLY | os.O_APPEND, dir_fd=kwargs["dir_fd"])
+                        try:
+                            os.write(fd, b"changed")
+                        finally:
+                            os.close(fd)
+                    return real_unlink(name, *args, **kwargs)
+
+                with patch.object(package_utils.os, "unlink", side_effect=mutate_before_unlink):
+                    with self.assertRaises(OSError):
+                        package_utils._remove_entry_at(parent_fd, victim.name, expected)
+                recovered = list(root.glob(".recovered-*"))
+                self.assertEqual(len(recovered), 1)
+                self.assertEqual(recovered[0].read_text(encoding="utf-8"), "safechanged")
+            finally:
+                os.close(parent_fd)
+
+    def test_private_staging_fstat_failure_closes_and_removes_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with patch.object(package_utils.os, "fstat", side_effect=OSError("injected fstat failure")):
+                    with self.assertRaises(OSError):
+                        package_utils._open_private_staging_directory(parent_fd, prefix=".probe-")
+                self.assertEqual(list(root.glob(".probe-*")), [])
+            finally:
+                os.close(parent_fd)
+
+    def test_private_staging_post_mkdir_stat_failure_closes_and_removes_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            real_stat = package_utils.os.stat
+            try:
+                def fail_post_mkdir_stat(name, *args, **kwargs):
+                    if isinstance(name, str) and name.startswith(".probe-"):
+                        raise OSError("injected post-mkdir stat failure")
+                    return real_stat(name, *args, **kwargs)
+
+                with patch.object(package_utils.os, "stat", side_effect=fail_post_mkdir_stat):
+                    with self.assertRaises(OSError):
+                        package_utils._open_private_staging_directory(parent_fd, prefix=".probe-")
+                self.assertEqual(list(root.glob(".probe-*")), [])
+            finally:
+                os.close(parent_fd)
+
+    def test_containment_exchange_failure_does_not_rename_unverified_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            canonical = root / "canonical"
+            trusted = root / "trusted"
+            canonical.write_text("replacement", encoding="utf-8")
+            trusted.write_text("trusted", encoding="utf-8")
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                expected = package_utils._entry_cleanup_identity_at(parent_fd, trusted.name)
+                with patch("package_utils._rename_exchange", side_effect=OSError("exchange unavailable")):
+                    with self.assertRaises(OSError):
+                        package_utils._contain_entry_at(parent_fd, canonical.name, expected, "probe")
+                self.assertTrue(canonical.exists())
+                self.assertEqual(canonical.read_text(encoding="utf-8"), "replacement")
+            finally:
+                os.close(parent_fd)
+
+    def test_private_staging_open_failure_removes_created_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                real_open = package_utils.os.open
+
+                def fail_staging_open(name, *args, **kwargs):
+                    if isinstance(name, str) and name.startswith(".probe-"):
+                        raise OSError("injected staging open failure")
+                    return real_open(name, *args, **kwargs)
+
+                with patch.object(package_utils.os, "open", side_effect=fail_staging_open):
+                    with self.assertRaises(OSError):
+                        package_utils._open_private_staging_directory(parent_fd, prefix=".probe-")
+                self.assertEqual(list(root.glob(".probe-*")), [])
+            finally:
+                os.close(parent_fd)
+
+    def test_remove_entry_at_can_require_held_directory_descriptor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staged = root / ".held"
+            staged.mkdir()
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            staged_fd = os.open(staged, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                staged_stat = os.fstat(staged_fd)
+                package_utils._remove_entry_at(
+                    parent_fd,
+                    staged.name,
+                    (staged_stat.st_dev, staged_stat.st_ino, "held-descriptor"),
+                    held_fd=staged_fd,
+                )
+                self.assertFalse(staged.exists())
+            finally:
+                os.close(staged_fd)
+                os.close(parent_fd)
+
+    def test_public_summary_whitelists_probe_metadata(self):
+        summary = _public_summary(
+            {"final_video_probe": {
+                "path": "/tmp/output/final.mp4",
+                "size_bytes": 123,
+                "sha256": "a" * 64,
+                "duration_seconds": 2.0,
+                "format_name": "mp4",
+                "has_audio": True,
+                "has_video": True,
+                "width": 1920,
+                "height": 1080,
+                "streams": [{"codec_type": "video", "tags": {"comment": "SECRET"}}],
+                "format": {"tags": {"comment": "SECRET"}},
+                "tags": {"comment": "SECRET"},
+            }},
+            Path("/tmp/output"),
+        )
+        probe = summary["final_video_probe"]
+        self.assertEqual(probe["path"], "final.mp4")
+        self.assertNotIn("streams", probe)
+        self.assertNotIn("format", probe)
+        self.assertNotIn("tags", probe)
+
+    def test_strict_json_rejects_excessive_nesting(self):
+        from package_utils import _parse_strict_json
+
+        with self.assertRaises(ValueError):
+            _parse_strict_json("[" * 300 + "0" + "]" * 300)
+
+    def test_safe_error_redacts_aws_identifiers_and_mixed_case_urls(self):
+        rendered = worker._safe_error("AKIAABCDEFGHIJKLMNOP HTTPS://EXAMPLE.COM/signed?token=secret")
+        self.assertNotIn("AKIAABCDEFGHIJKLMNOP", rendered)
+        self.assertIn("[credential-redacted]", rendered)
+        mixed_case_aws = worker._safe_error("aKiA1234567890123456")
+        self.assertNotIn("aKiA1234567890123456", mixed_case_aws)
+        self.assertIn("[credential-redacted]", mixed_case_aws)
+        self.assertNotIn("HTTPS://EXAMPLE.COM", rendered)
+        self.assertIn("[provider-url-redacted]", rendered)
+
+        token_key = "refresh_" + "token"
+        redacted = worker._safe_error(f"topic\n\x1b[31m{token_key}: secret-value\x1b[0m")
+        self.assertNotIn("\n", redacted)
+        self.assertNotIn("\x1b", redacted)
+        self.assertNotIn("secret-value", redacted)
+        self.assertIn("[redacted]", redacted)
+        bearer_url = worker._safe_error("Bearer https://provider.invalid/path?token=secret-value")
+        self.assertNotIn("provider.invalid", bearer_url)
+        self.assertNotIn("secret-value", bearer_url)
+        quoted_json = worker._safe_error('{"token":"quoted-secret"}')
+        self.assertNotIn("quoted-secret", quoted_json)
+        quoted_whitespace = worker._safe_error('{"token":"secret value with spaces"}')
+        self.assertNotIn("secret value with spaces", quoted_whitespace)
+        self.assertIn("[redacted]", quoted_whitespace)
+        escaped_secret = r'escaped \"value\" tail'
+        for syntax in (
+            'token: "secret value with spaces"',
+            'token = "secret value with spaces"',
+            'password: "' + escaped_secret + '"',
+        ):
+            rendered = worker._safe_error(syntax)
+            self.assertNotIn("secret value with spaces", rendered)
+            self.assertNotIn(escaped_secret, rendered)
+            self.assertIn("[redacted]", rendered)
+
+    def test_thumbnail_prompt_uses_storyboard_aspect_ratio(self):
+        import pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brief = root / "brief.json"
+            brief.write_text(json.dumps({"topic": "Vertical story", "tone": "professional"}), encoding="utf-8")
+            (root / "storyboard.json").write_text(
+                json.dumps({"output_profile": "vertical", "aspect_ratio": "9:16", "total_duration": 10}),
+                encoding="utf-8",
+            )
+            pipeline._generate_thumbnail_prompt(root, brief)
+            prompt = json.loads((root / "thumbnail_prompt.json").read_text(encoding="utf-8"))
+            self.assertIn("9:16", prompt["prompt"])
+            self.assertNotIn("4K, 16:9", prompt["prompt"])
+
+    def test_design_agent_thumbnail_prompt_uses_storyboard_aspect_ratio(self):
+        from engines.design_agent import generate_thumbnail_prompt
+
+        storyboard = {"output_profile": "vertical", "aspect_ratio": "9:16", "total_duration": 10}
+        prompt = generate_thumbnail_prompt(storyboard, {"topic": "Vertical story", "tone": "professional"})
+        self.assertIn("9:16", prompt["prompt"])
+        self.assertNotIn("4K, 16:9", prompt["prompt"])
+
+    def test_generation_plan_rejects_malformed_status_types_without_raising(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "clips").mkdir()
+            base = {
+                "total_scenes": 1,
+                "output_profile": "landscape",
+                "aspect_ratio": "16:9",
+                "resolution": "1920x1080",
+                "scenes": [{
+                    "scene_number": 1,
+                    "duration_seconds": 1.0,
+                    "status": "dry_run",
+                    "target_file": "clips/scene_01.mp4",
+                }],
+            }
+            for malformed in (
+                {**base, "status": {}},
+                {**base, "status": "dry_run", "scenes": [{**base["scenes"][0], "status": {}}]},
+            ):
+                (root / "clips" / "generation_plan.json").write_text(json.dumps(malformed), encoding="utf-8")
+                result = _generation_plan_info(root)
+                self.assertFalse(result["valid"])
+                self.assertIsNone(result["status"])
+                self.assertTrue(result["errors"])
+
+    def test_generation_plan_rejects_mixed_dry_run_and_completed_scene_statuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "clips").mkdir()
+            (root / "clips" / "generation_plan.json").write_text(json.dumps({
+                "status": "completed",
+                "total_scenes": 1,
+                "output_profile": "landscape",
+                "aspect_ratio": "16:9",
+                "resolution": "1920x1080",
+                "scenes": [{
+                    "scene_number": 1,
+                    "duration_seconds": 1.0,
+                    "status": "dry_run",
+                    "target_file": "clips/scene_01.mp4",
+                    "sha256": "0" * 64,
+                }],
+            }), encoding="utf-8")
+            result = _generation_plan_info(root)
+            self.assertFalse(result["valid"])
+
+    def test_worker_thumbnail_prompt_uses_storyboard_aspect_ratio(self):
+        import worker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brief = root / "brief.json"
+            brief.write_text(json.dumps({"topic": "Vertical story", "tone": "professional"}), encoding="utf-8")
+            (root / "storyboard.json").write_text(
+                json.dumps({"output_profile": "vertical", "aspect_ratio": "9:16", "total_duration": 10}),
+                encoding="utf-8",
+            )
+            worker._generate_thumbnail_for_job(root, brief)
+            prompt = json.loads((root / "thumbnail_prompt.json").read_text(encoding="utf-8"))
+            self.assertIn("9:16", prompt["prompt"])
+            self.assertNotIn("4K, 16:9", prompt["prompt"])
+
+    def test_normalize_output_profile_rejects_malformed_falsy_values(self):
+        for value in (False, 0, [], {}, ""):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    normalize_output_profile(value)
+
+        self.assertEqual(normalize_output_profile(None)["output_profile"], "landscape")
+
+    def test_profile_contract_rejects_malformed_secondary_metadata(self):
+        for payload in (
+            {"output_profile": "vertical", "aspect_ratio": False},
+            {"output_profile": "vertical", "resolution": "not-a-resolution"},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    validate_output_profile_contract(payload, "test")
+
+    def test_private_staging_rejects_directory_replaced_before_open(self):
+        import package_utils
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            state = {}
+            real_mkdir = package_utils.os.mkdir
+            real_open = package_utils.os.open
+
+            def mkdir_and_record(name, mode, *, dir_fd):
+                real_mkdir(name, mode, dir_fd=dir_fd)
+                if dir_fd == parent_fd and not state:
+                    state["name"] = name
+
+            def open_and_replace(name, flags, mode=0o777, *, dir_fd=None):
+                descriptor = real_open(name, flags, mode, dir_fd=dir_fd)
+                if dir_fd == parent_fd and name == state.get("name") and "swapped" not in state:
+                    state["swapped"] = True
+                    os.rename(name, "original-staging", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                    real_mkdir(name, 0o700, dir_fd=parent_fd)
+                    (root / name / "attacker-marker").write_text("must-survive", encoding="utf-8")
+                return descriptor
+
+            try:
+                with patch("package_utils.os.mkdir", side_effect=mkdir_and_record), patch(
+                    "package_utils.os.open", side_effect=open_and_replace
+                ):
+                    with self.assertRaises(OSError):
+                        package_utils._open_private_staging_directory(parent_fd)
+            finally:
+                os.close(parent_fd)
+            replacement = root / state["name"]
+            self.assertEqual((replacement / "attacker-marker").read_text(encoding="utf-8"), "must-survive")
+
+    def test_atomic_json_failure_preserves_replaced_temporary_inode(self):
+        import package_utils
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.json"
+
+            def fail_after_replacing_temp(_payload, handle, **_kwargs):
+                temporary = Path(os.readlink(f"/proc/self/fd/{handle.fileno()}"))
+                temporary.unlink()
+                temporary.write_text("attacker-replacement", encoding="utf-8")
+                raise OSError("injected writer failure")
+
+            with patch("package_utils.json.dump", side_effect=fail_after_replacing_temp):
+                with self.assertRaises(OSError):
+                    package_utils.atomic_write_json(path, {"safe": True})
+            leftovers = list(Path(tmp).glob(".staging-*"))
+            self.assertTrue(leftovers)
+            self.assertTrue(
+                any(
+                    child.is_file() and child.read_text(encoding="utf-8") == "attacker-replacement"
+                    for item in leftovers
+                    for child in item.iterdir()
+                )
+            )
+
+    def test_atomic_text_failure_preserves_replaced_temporary_inode(self):
+        import package_utils
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "manifest.txt"
+            real_fsync = package_utils.os.fsync
+            state = {}
+
+            def fail_after_replacing_temp(fd):
+                real_fsync(fd)
+                if not state:
+                    state["triggered"] = True
+                    temporary = Path(os.readlink(f"/proc/self/fd/{fd}"))
+                    temporary.unlink()
+                    temporary.write_text("attacker-replacement", encoding="utf-8")
+                    raise OSError("injected writer failure")
+
+            with patch("package_utils.os.fsync", side_effect=fail_after_replacing_temp):
+                with self.assertRaises(OSError):
+                    package_utils.atomic_write_text(path, "trusted")
+            leftovers = list(Path(tmp).glob(".staging-*"))
+            self.assertTrue(leftovers)
+            self.assertTrue(
+                any(
+                    child.is_file() and child.read_text(encoding="utf-8") == "attacker-replacement"
+                    for item in leftovers
+                    for child in item.iterdir()
+                )
+            )
+
+    def test_cleanup_claim_rechecks_replacement_before_deletion(self):
+        for kind in ("file", "symlink", "directory"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                entry = root / "victim"
+                original = root / "original"
+                if kind == "file":
+                    entry.write_text("trusted", encoding="utf-8")
+                elif kind == "symlink":
+                    (root / "trusted-target").write_text("trusted", encoding="utf-8")
+                    entry.symlink_to("trusted-target")
+                else:
+                    entry.mkdir()
+                    (entry / "trusted.txt").write_text("trusted", encoding="utf-8")
+                expected = package_utils._entry_cleanup_identity_at(os.open(root, os.O_RDONLY | os.O_DIRECTORY), "victim")
+                parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                swapped = False
+                real_rename = package_utils.os.rename
+                try:
+                    def replace_during_claim(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+                        nonlocal swapped
+                        if not swapped and src == "victim" and dst == "entry" and src_dir_fd == parent_fd:
+                            swapped = True
+                            real_rename(entry, original)
+                            if kind == "file":
+                                entry.write_text("replacement", encoding="utf-8")
+                            elif kind == "symlink":
+                                entry.symlink_to("replacement-target")
+                            else:
+                                entry.mkdir()
+                                (entry / "replacement.txt").write_text("replacement", encoding="utf-8")
+                        return real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+                    with patch("package_utils.os.rename", side_effect=replace_during_claim):
+                        with self.assertRaises(OSError):
+                            package_utils._remove_entry_at(parent_fd, "victim", expected)
+                finally:
+                    os.close(parent_fd)
+                self.assertTrue(original.exists())
+                recovered = [path for path in root.iterdir() if path.name.startswith(".recovered-")]
+                self.assertTrue(recovered)
+                if kind == "file":
+                    self.assertTrue(any(path.is_file() and path.read_text(encoding="utf-8") == "replacement" for path in recovered))
+                elif kind == "symlink":
+                    self.assertTrue(any(path.is_symlink() for path in recovered))
+                else:
+                    self.assertTrue(any(path.is_dir() and (path / "replacement.txt").read_text(encoding="utf-8") == "replacement" for path in recovered))
+
+    def test_placeholder_cleanup_rechecks_replacement_before_deletion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            canonical = root / "canonical"
+            trusted = root / "trusted"
+            canonical.write_text("attacker", encoding="utf-8")
+            trusted.write_text("trusted", encoding="utf-8")
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            swapped = False
+            real_rename = package_utils.os.rename
+            try:
+                expected = package_utils._entry_cleanup_identity_at(parent_fd, "trusted")
+
+                def replace_placeholder(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+                    nonlocal swapped
+                    if not swapped and src == "canonical" and dst == "entry" and src_dir_fd == parent_fd:
+                        swapped = True
+                        real_rename(root / "canonical", root / "placeholder-original")
+                        canonical.write_text("replacement", encoding="utf-8")
+                    return real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+                with patch("package_utils.os.rename", side_effect=replace_placeholder):
+                    with self.assertRaises(OSError):
+                        package_utils._contain_entry_at(parent_fd, "canonical", expected, "test-placeholder")
+            finally:
+                os.close(parent_fd)
+            self.assertFalse(canonical.exists())
+            self.assertTrue((root / "placeholder-original").exists())
+            self.assertTrue(any(path.is_file() and path.read_text(encoding="utf-8") == "replacement" for path in root.glob(".recovered-*")))
+
+    def test_json_artifact_rejects_oversized_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "oversized.json"
+            with path.open("wb") as handle:
+                handle.truncate(package_utils.MAX_JSON_BYTES + 1)
+            with self.assertRaises(ValueError):
+                package_utils.read_json_artifact(path)
+
+    def test_cleanup_rejects_same_inode_replacement_with_reused_ctime(self):
+        import package_utils
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = root / "victim"
+            entry.write_text("trusted", encoding="utf-8")
+            original = os.lstat(entry)
+            entry.unlink()
+            entry.write_text("replacement", encoding="utf-8")
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaises(OSError):
+                    package_utils._remove_entry_at(parent_fd, entry.name, package_utils._cleanup_identity(original))
+            finally:
+                os.close(parent_fd)
+            self.assertEqual(entry.read_text(encoding="utf-8"), "replacement")
+
+    def test_cleanup_rejects_in_place_same_inode_mutation_during_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry = root / "victim"
+            entry.write_text("trusted", encoding="utf-8")
+            parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            real_rename = package_utils.os.rename
+            mutated = False
+            try:
+                expected = package_utils._cleanup_identity(os.lstat(entry))
+
+                def mutate_during_claim(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+                    nonlocal mutated
+                    if not mutated and src == "victim" and dst == "entry" and src_dir_fd == parent_fd:
+                        mutated = True
+                        entry.write_text("changed", encoding="utf-8")
+                    return real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+                with patch("package_utils.os.rename", side_effect=mutate_during_claim):
+                    with self.assertRaises(OSError):
+                        package_utils._remove_entry_at(parent_fd, entry.name, expected)
+            finally:
+                os.close(parent_fd)
+            self.assertTrue(mutated)
+            recovered = [path for path in root.iterdir() if path.name.startswith(".recovered-")]
+            self.assertTrue(recovered)
+            self.assertEqual(recovered[0].read_text(encoding="utf-8"), "changed")
+
+    def test_atomic_writers_quarantine_canonical_replacement_during_verification(self):
+        import package_utils
+
+        for suffix, writer, payload in ((".json", package_utils.atomic_write_json, {"safe": True}), (".txt", package_utils.atomic_write_text, "trusted")):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / f"manifest{suffix}"
+                path.write_text("old", encoding="utf-8")
+                real_open = package_utils._open_regular_descriptor
+                swapped = False
+
+                def replace_before_verify(candidate):
+                    nonlocal swapped
+                    if not swapped and Path(candidate) == path:
+                        swapped = True
+                        path.unlink()
+                        path.write_text("attacker-replacement", encoding="utf-8")
+                        raise OSError("injected verification race")
+                    return real_open(candidate)
+
+                with patch("package_utils._open_regular_descriptor", side_effect=replace_before_verify):
+                    with self.assertRaises(OSError):
+                        if suffix == ".json":
+                            cast(Any, writer)(path, payload)
+                        else:
+                            cast(Any, writer)(path, str(payload))
+                self.assertFalse(path.exists())
+                quarantined = [candidate for candidate in Path(tmp).iterdir() if candidate.name.startswith(".atomic-publication.untrusted-")]
+                self.assertTrue(quarantined)
+                self.assertEqual(quarantined[0].read_text(encoding="utf-8"), "attacker-replacement")
+
         from package_utils import atomic_write_json
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -55,7 +614,7 @@ class PackageStatusTests(unittest.TestCase):
             path = Path(tmp) / "voiceover.mp3"
             path.write_bytes(b"audio")
             with patch("package_utils.shutil.which", return_value="/usr/bin/ffprobe"), patch(
-                "package_utils.subprocess.run",
+                "package_utils._run_bounded_subprocess",
                 return_value=SimpleNamespace(returncode=0, stdout=json.dumps({"streams": [{"codec_type": "audio"}], "format": {"duration": "Infinity"}}), stderr=""),
             ):
                 result = _probe_media(path)
@@ -193,7 +752,7 @@ class PackageStatusTests(unittest.TestCase):
 
             import subprocess
             with patch("package_utils.shutil.which", return_value="ffprobe"), patch(
-                "package_utils.subprocess.run", side_effect=subprocess.TimeoutExpired("ffprobe", 15)
+                "package_utils._run_bounded_subprocess", side_effect=subprocess.TimeoutExpired("ffprobe", 15)
             ):
                 status = compute_package_status(root, "completed")
 
@@ -241,7 +800,7 @@ class PackageStatusTests(unittest.TestCase):
             (root / "clips" / "scene_01.mp4").write_bytes(b"valid enough for mocked ffprobe")
             (root / "clips" / "scene_99.mp4").write_bytes(b"valid enough for mocked ffprobe")
 
-            def fake_probe(path):
+            def fake_probe(path, **_kwargs):
                 if path.name.startswith("scene_"):
                     return {"path": str(path), "exists": True, "size_bytes": 1, "ffprobe_checked": True, "valid": True, "duration_seconds": 1.0}
                 return {"path": str(path), "exists": False, "size_bytes": 0, "ffprobe_checked": False, "valid": False}
@@ -264,7 +823,7 @@ class PackageStatusTests(unittest.TestCase):
             (root / "clips" / "scene_01.mp4").write_bytes(b"valid enough for mocked ffprobe")
             (root / "clips" / "scene_99.MP4").write_bytes(b"valid enough for mocked ffprobe")
 
-            def fake_probe(path):
+            def fake_probe(path, **_kwargs):
                 if path.name.startswith("scene_"):
                     return {"path": str(path), "exists": True, "size_bytes": 1, "ffprobe_checked": True, "valid": True, "duration_seconds": 1.0}
                 return {"path": str(path), "exists": False, "size_bytes": 0, "ffprobe_checked": False, "valid": False}
@@ -305,7 +864,7 @@ class PackageStatusTests(unittest.TestCase):
             os.mkfifo(clips / "scene_01.mp4.fifo")
             invalid_names = sorted((*artifact_names, "scene_01.mp4.symlink", "scene_01.mp4.fifo"))
 
-            def fake_probe(path):
+            def fake_probe(path, **_kwargs):
                 if path.name == "scene_01.mp4":
                     return {"path": str(path), "exists": True, "size_bytes": 1, "ffprobe_checked": True, "valid": True, "duration_seconds": 1.0}
                 return {"path": str(path), "exists": False, "size_bytes": 0, "ffprobe_checked": False, "valid": False}
@@ -326,7 +885,7 @@ class PackageStatusTests(unittest.TestCase):
             for scene_number in (1, 2, 99):
                 (root / "clips" / f"scene_{scene_number:02d}.mp4").write_bytes(b"verified")
 
-            def fake_probe(path):
+            def fake_probe(path, **_kwargs):
                 if path.suffix == ".mp4":
                     return {"path": str(path), "exists": True, "size_bytes": 1, "ffprobe_checked": True, "valid": True, "duration_seconds": 1.0}
                 return {"path": str(path), "exists": False, "size_bytes": 0, "ffprobe_checked": False, "valid": False}
@@ -375,7 +934,7 @@ class GenerationAgentTests(unittest.TestCase):
     def test_generation_agent_rejects_failed_array_provider_response(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch(
-                "engines.generation_agent.subprocess.run",
+                "engines.generation_agent._run_bounded_subprocess",
                 return_value=SimpleNamespace(
                     returncode=0,
                     stdout=json.dumps([{"status": "failed", "result_url": "https://provider.example/video.mp4"}]),
@@ -413,6 +972,45 @@ class GenerationAgentTests(unittest.TestCase):
             self.assertFalse((root / "clips" / "scene_01.mp4").exists())
             self.assertIn("SOLO_STUDIO_ENABLE_HIGGSFIELD", plan["setup_needed"])
             self.assertEqual(plan["scenes"][0]["source_prompts"]["seedance"], "A Seedance-specific product shot.")
+
+    def test_generation_agent_propagates_vertical_profile_in_dry_run_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompts = root / "video_prompts.json"
+            prompts.write_text(json.dumps({
+                "output_profile": "vertical",
+                "aspect_ratio": "9:16",
+                "resolution": "1080x1920",
+                "scenes": [{
+                    "scene_number": 1,
+                    "duration_seconds": 6,
+                    "visual_description": "A founder presenting a phone app.",
+                    "camera": "slow push in",
+                }],
+            }))
+
+            plan = generate_plan(prompts, root)
+
+            self.assertEqual(plan["status"], "dry_run")
+            self.assertEqual(plan["output_profile"], "vertical")
+            self.assertEqual(plan["aspect_ratio"], "9:16")
+            self.assertEqual(plan["resolution"], "1080x1920")
+            self.assertEqual(plan["scenes"][0]["output_profile"], "vertical")
+            self.assertIn("9:16 vertical video clip", plan["scenes"][0]["prompt"])
+
+    def test_higgsfield_command_uses_requested_aspect_ratio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_file = Path(tmp) / "scene_01.mp4"
+            with patch.dict("os.environ", {"SOLO_STUDIO_ENABLE_HIGGSFIELD": "1"}), patch(
+                "engines.generation_agent._run_bounded_subprocess",
+                return_value=SimpleNamespace(returncode=2, stdout="", stderr="provider failure"),
+            ) as run:
+                result = run_higgsfield("safe prompt", 5, out_file, "seedance_2_0", "9:16")
+
+            self.assertEqual(result["status"], "failed")
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("--aspect_ratio") + 1], "9:16")
+            self.assertFalse(out_file.exists())
 
     def test_generation_agent_accepts_documented_array_provider_response(self):
         from engines.generation_agent import _provider_url
@@ -455,7 +1053,7 @@ class GenerationAgentTests(unittest.TestCase):
             clip = Path(tmp) / "scene.mp4"
             clip.write_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00")
             with patch("engines.generation_agent.shutil.which", return_value="/usr/bin/ffprobe"), patch(
-                "engines.generation_agent.subprocess.run",
+                "engines.generation_agent._run_bounded_subprocess",
                 return_value=SimpleNamespace(
                     returncode=0,
                     stdout=json.dumps({"streams": [], "format": {"duration": "1.0"}}),
@@ -467,7 +1065,7 @@ class GenerationAgentTests(unittest.TestCase):
             self.assertIn("no video stream", reason or "")
 
             with patch("engines.generation_agent.shutil.which", return_value="/usr/bin/ffprobe"), patch(
-                "engines.generation_agent.subprocess.run",
+                "engines.generation_agent._run_bounded_subprocess",
                 return_value=SimpleNamespace(
                     returncode=0,
                     stdout=json.dumps({"streams": [{"codec_type": "video"}], "format": {"duration": "NaN"}}),
@@ -512,7 +1110,7 @@ class GenerationAgentTests(unittest.TestCase):
 
             with patch.dict("os.environ", {"SOLO_STUDIO_ENABLE_HIGGSFIELD": "1"}), patch(
                 "engines.generation_agent.shutil.which", return_value="/usr/local/bin/higgsfield"
-            ), patch("engines.generation_agent.subprocess.run") as run, patch(
+            ), patch("engines.generation_agent._run_bounded_subprocess") as run, patch(
                 "engines.generation_agent._open_provider_url", return_value=FakeResponse()
             ), patch(
                 "engines.generation_agent._verify_clip", return_value=(True, None)
@@ -534,8 +1132,8 @@ class GenerationAgentTests(unittest.TestCase):
     def test_generation_agent_submission_is_single_shot(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_file = Path(tmp) / "scene_01.mp4"
-            with patch.dict("os.environ", {"SOLO_STUDIO_HIGGSFIELD_TIMEOUT": "1"}), patch(
-                "engines.generation_agent.subprocess.run",
+            with patch.dict("os.environ", {"SOLO_STUDIO_HIGGSFIELD_TIMEOUT": "1", "SOLO_STUDIO_ENABLE_HIGGSFIELD": "1"}), patch(
+                "engines.generation_agent._run_bounded_subprocess",
                 return_value=SimpleNamespace(returncode=2, stdout="", stderr="provider failure"),
             ) as run:
                 result = run_higgsfield("secret prompt", 5, out_file, "seedance_2_0")
@@ -567,7 +1165,7 @@ class GenerationAgentTests(unittest.TestCase):
                 "engines.generation_agent.shutil.which",
                 side_effect=["/usr/bin/higgsfield", "/usr/bin/ffprobe"],
             ), patch(
-                "engines.generation_agent.subprocess.run",
+                "engines.generation_agent._run_bounded_subprocess",
                 return_value=SimpleNamespace(
                     returncode=0,
                     stdout=json.dumps({"result_url": "https://cdn.example.test/bad"}),
@@ -600,7 +1198,7 @@ class GenerationAgentTests(unittest.TestCase):
             with patch.dict("os.environ", {"SOLO_STUDIO_ENABLE_HIGGSFIELD": "1"}), patch(
                 "engines.generation_agent.shutil.which", return_value="/usr/bin/higgsfield"
             ), patch(
-                "engines.generation_agent.subprocess.run",
+                "engines.generation_agent._run_bounded_subprocess",
                 return_value=SimpleNamespace(
                     returncode=0,
                     stdout=json.dumps({"result_url": "https://cdn.example.test/empty.mp4"}),
@@ -626,7 +1224,7 @@ class GenerationAgentTests(unittest.TestCase):
             })
             with patch.dict("os.environ", {"SOLO_STUDIO_ENABLE_HIGGSFIELD": "1"}), patch(
                 "engines.generation_agent.shutil.which", return_value="/usr/bin/higgsfield"
-            ), patch("engines.generation_agent.subprocess.run") as run, patch(
+            ), patch("engines.generation_agent._run_bounded_subprocess") as run, patch(
                 "engines.generation_agent._open_provider_url"
             ) as opener:
                 run.return_value.returncode = 0
@@ -652,7 +1250,7 @@ class GenerationAgentTests(unittest.TestCase):
 
             with patch.dict("os.environ", {"SOLO_STUDIO_ENABLE_HIGGSFIELD": "1"}), patch(
                 "engines.generation_agent.shutil.which", return_value="/usr/bin/higgsfield"
-            ), patch("engines.generation_agent.subprocess.run") as run, patch(
+            ), patch("engines.generation_agent._run_bounded_subprocess") as run, patch(
                 "engines.generation_agent._open_provider_url"
             ) as opener:
                 run.return_value.returncode = 2
@@ -687,7 +1285,7 @@ class GenerationAgentTests(unittest.TestCase):
             with patch.dict("os.environ", {"SOLO_STUDIO_ENABLE_HIGGSFIELD": "1"}), patch(
                 "engines.generation_agent.shutil.which", return_value="/usr/bin/higgsfield"
             ), patch(
-                "engines.generation_agent.subprocess.run",
+                "engines.generation_agent._run_bounded_subprocess",
                 side_effect=subprocess.TimeoutExpired(
                     ["higgsfield", "generate", "create", "seedance", "--prompt", "SECRET PROMPT MUST NOT LEAK"],
                     timeout=900,
@@ -717,7 +1315,7 @@ class GenerationAgentTests(unittest.TestCase):
 
             with patch.dict("os.environ", {"SOLO_STUDIO_ENABLE_HIGGSFIELD": "1"}), patch(
                 "engines.generation_agent.shutil.which", return_value="/usr/bin/higgsfield"
-            ), patch("engines.generation_agent.subprocess.run") as run, patch(
+            ), patch("engines.generation_agent._run_bounded_subprocess") as run, patch(
                 "engines.generation_agent._open_provider_url"
             ) as urlopen:
                 run.return_value.returncode = 0
@@ -741,7 +1339,7 @@ class GenerationAgentTests(unittest.TestCase):
 
             with patch.dict("os.environ", {"SOLO_STUDIO_ENABLE_HIGGSFIELD": "1"}), patch(
                 "engines.generation_agent.shutil.which", return_value="/usr/bin/higgsfield"
-            ), patch("engines.generation_agent.subprocess.run") as run:
+            ), patch("engines.generation_agent._run_bounded_subprocess") as run:
                 plan = generate_plan(prompts, root)
 
             self.assertEqual(plan["status"], "failed")
@@ -1036,14 +1634,13 @@ class FrontendContractTests(unittest.TestCase):
             html,
             re.S,
         )
-        stages = re.search(r"const stages = \[(.*?)\];", html, re.S)
-
-        if block is None or stages is None:
-            self.fail("frontend pipeline DOM block or stage array not found")
+        if block is None:
+            self.fail("frontend pipeline DOM block not found")
         placeholders = block.group(1).count('class="pipeline-step"')
-        stage_count = len(re.findall(r"'[^']+'", stages.group(1)))
 
-        self.assertEqual(placeholders, stage_count)
+        self.assertEqual(placeholders, len(job_store.DEFAULT_STAGE_NAMES))
+        self.assertIn("job.stages.map(stage => stage && stage.stage_name)", html)
+        self.assertIn("editing: 'Editing scenes into the final timeline...'", html)
 
     def test_download_artifact_pills_are_derived_from_artifact_summary(self):
         html = (ROOT / "frontend" / "index.html").read_text()
@@ -1491,6 +2088,37 @@ class ApiPackageStatusTests(unittest.TestCase):
             self.assertEqual(parsed["key_messages"], job["key_messages"])
             self.assertEqual(parsed["visual_style"], job["visual_style"])
 
+    def test_write_brief_yaml_carries_output_profile_with_landscape_default(self):
+        import yaml
+        import api
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base_job = {
+                "topic": "Profile test",
+                "target_audience": "founders",
+                "duration_seconds": 60,
+                "platform": "youtube",
+                "tone": "professional",
+                "key_messages": [],
+                "visual_style": "",
+                "call_to_action": "",
+            }
+
+            default_path = root / "default.yaml"
+            api._write_brief_yaml(default_path, base_job)
+            default_payload = yaml.safe_load(default_path.read_text())
+
+            vertical_path = root / "vertical.yaml"
+            vertical_job = {**base_job, "output_profile": "vertical", "aspect_ratio": "9:16"}
+            api._write_brief_yaml(vertical_path, vertical_job)
+            vertical_payload = yaml.safe_load(vertical_path.read_text())
+
+            self.assertEqual(default_payload["output_profile"], "landscape")
+            self.assertEqual(default_payload["aspect_ratio"], "16:9")
+            self.assertEqual(vertical_payload["output_profile"], "vertical")
+            self.assertEqual(vertical_payload["aspect_ratio"], "9:16")
+
     def test_dockerfile_fails_container_when_critical_process_exits(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         dockerignore = (ROOT / ".dockerignore").read_text()
@@ -1541,20 +2169,25 @@ class ApiPackageStatusTests(unittest.TestCase):
         deploy = (ROOT / "deploy-traefik.sh").read_text()
         dockerfile = (ROOT / "Dockerfile").read_text()
 
-        self.assertIn("SOLO_STUDIO_API_TOKEN:?", deploy)
-        self.assertIn("-e SOLO_STUDIO_API_TOKEN", deploy)
+        self.assertIn("SOLO_STUDIO_API_TOKEN_FILE", deploy)
+        self.assertIn("-e SOLO_STUDIO_API_TOKEN_FILE=/run/secrets/solo_studio_api_token", deploy)
+        self.assertIn('type=bind,src=$SOLO_STUDIO_API_TOKEN_FILE,dst=/run/secrets/solo_studio_api_token,ro', deploy)
+        self.assertNotIn("-e SOLO_STUDIO_API_TOKEN \\\n", deploy)
         self.assertIn("-e SOLO_STUDIO_REQUIRE_API_TOKEN=1", deploy)
         self.assertIn("-e SOLO_STUDIO_TRUST_PROXY_HEADERS=1", deploy)
         self.assertIn("-e SOLO_STUDIO_TRUSTED_PROXY_NETWORKS=127.0.0.1/32,::1/128", deploy)
         self.assertIn("-e SOLO_STUDIO_SESSION_COOKIE_PATH=/video", deploy)
         self.assertIn("SOLO_STUDIO_CORS_ORIGINS", deploy)
         self.assertIn('case "${SOLO_STUDIO_ENABLE_HIGGSFIELD,,}"', deploy)
-        self.assertIn("curl_config=$(mktemp)", deploy)
-        self.assertIn("chmod 600 \"$curl_config\"", deploy)
-        self.assertIn("printf '%s\\n'", deploy)
-        self.assertIn("Authorization: Bearer", deploy)
-        self.assertIn('> \"$curl_config\"', deploy)
-        self.assertNotIn("Authorization: Bearer ***", deploy)
+        self.assertIn("curl_config_dir=$(mktemp -d)", deploy)
+        self.assertIn("chmod 700 \"$curl_config_dir\"", deploy)
+        self.assertIn("os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)", deploy)
+        self.assertIn("os.fstat(token_fd)", deploy)
+        self.assertIn("os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)", deploy)
+        self.assertIn('/run/secrets/solo_studio_api_token', deploy)
+        self.assertIn('--config \"$token_config\"', deploy)
+        self.assertNotIn('Authorization: Bearer $SOLO_STUDIO_API_TOKEN', deploy)
+        self.assertNotIn('> \"$curl_config\"', deploy)
         self.assertIn("SOLO_STUDIO_CURL_CONNECT_TIMEOUT", deploy)
         self.assertIn("SOLO_STUDIO_CURL_MAX_TIME", deploy)
         self.assertIn("CURL_BOUNDED=(--connect-timeout", deploy)
@@ -1600,6 +2233,32 @@ class ApiPackageStatusTests(unittest.TestCase):
         self.assertIn("SOLO_STUDIO_HIGGSFIELD_MODEL", deploy)
         self.assertIn("HIGGSFIELD_CREDENTIALS_FILE", deploy)
         self.assertIn("credentials.json:ro", deploy)
+
+    def test_package_status_passes_deadline_to_voiceover_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "audio"
+            audio.mkdir()
+            (audio / "voiceover.mp3").write_bytes(b"voiceover")
+            seen = []
+
+            def probe(path, *, deadline=None, **_kwargs):
+                seen.append((Path(path).name, deadline))
+                return {"valid": False}
+
+            deadline = time.monotonic() + 60.0
+            with patch("package_utils._probe_media", side_effect=probe):
+                compute_package_status(root, deadline=deadline)
+
+            self.assertIn(("voiceover.mp3", deadline), seen)
+    def test_package_status_stops_when_deadline_is_expired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("package_utils._probe_media", side_effect=AssertionError("probe must not start after deadline")):
+                summary = compute_package_status(root, deadline=0.0)
+            self.assertFalse(summary["has_final_video"])
+            self.assertFalse(summary["has_voiceover"])
+            self.assertIn("deadline exceeded", " ".join(summary["artifact_errors"]))
 
 
 if __name__ == "__main__":

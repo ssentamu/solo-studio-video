@@ -13,13 +13,25 @@ import os
 import shutil
 import stat
 import subprocess
-import tempfile
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
-from package_utils import _open_directory_no_follow, _open_regular_descriptor
+from package_utils import (
+    _open_directory_no_follow,
+    _open_regular_descriptor,
+    _parse_strict_json,
+    _publication_lock,
+    _remove_entry_at,
+    _contain_entry_at,
+    _cleanup_identity,
+    _entry_cleanup_identity_at,
+    _open_private_staging_directory,
+    _run_bounded_subprocess,
+)
 
 
 class MediaError(RuntimeError):
@@ -37,26 +49,159 @@ class PublicationRequest:
     verified: Mapping[str, Any]
     verified_descriptor: int
     verified_inode: tuple[int, int]
+    deadline: float | None = None
 
 
 PublicationCallback = Callable[[PublicationRequest], None]
 
 
+def _remove_failed_canonical(request: PublicationRequest) -> None:
+    """Contain the current canonical entry after a failed publication."""
+    try:
+        current = os.lstat(request.destination_name, dir_fd=request.destination_dir_fd)
+    except FileNotFoundError:
+        return
+    expected_cleanup_identity = _cleanup_identity(os.fstat(request.verified_descriptor))
+    _contain_entry_at(
+        request.destination_dir_fd,
+        request.destination_name,
+        expected_cleanup_identity,
+        "failed-media-publication",
+        deadline=request.deadline,
+    )
+    try:
+        os.lstat(request.destination_name, dir_fd=request.destination_dir_fd)
+    except FileNotFoundError:
+        return
+    raise OSError("failed publication canonical entry remains present")
+
+
+def _positive_int(value: Any, label: str) -> int:
+    if isinstance(value, bool):
+        raise MediaError(f"{label} is invalid")
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise MediaError(f"{label} is invalid") from exc
+    if number <= 0:
+        raise MediaError(f"{label} is invalid")
+    return number
+
+
+def _unlink_if_unchanged(
+    directory_fd: int,
+    name: str,
+    expected_inode: tuple[object, ...],
+    *,
+    deadline: float | None = None,
+) -> None:
+    """Claim and remove only the expected directory entry."""
+    _remove_entry_at(directory_fd, name, expected_inode, deadline=deadline)
+
+
+@contextmanager
+def _owned_temporary_directory(parent_fd: int, prefix: str, *, deadline: float | None = None):
+    """Create scratch space with a held descriptor and identity-bound cleanup."""
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("assembly scratch creation deadline exceeded")
+    temporary_name, temporary_fd = _open_private_staging_directory(parent_fd)
+    temporary_path = Path(f"/proc/self/fd/{parent_fd}") / temporary_name
+    try:
+        temporary_stat = os.fstat(temporary_fd)
+        temporary_identity = (temporary_stat.st_dev, temporary_stat.st_ino, "held-directory")
+    except BaseException:
+        os.close(temporary_fd)
+        try:
+            _remove_entry_at(parent_fd, temporary_name, deadline=deadline)
+        except OSError:
+            pass
+        raise
+    try:
+        yield temporary_path, temporary_fd
+    finally:
+        try:
+            _remove_entry_at(parent_fd, temporary_name, temporary_identity, deadline=deadline)
+            os.fsync(parent_fd)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(temporary_fd)
+
+
 def publish_verified_output(request: PublicationRequest) -> None:
-    """Perform the existing descriptor-safe atomic publication operation."""
+    """Serialize cooperating publishers around descriptor-safe publication."""
+    with _publication_lock(request.destination_dir_fd, request.destination_name, deadline=request.deadline):
+        _publish_verified_output_locked(request)
+
+
+def _publish_verified_output_locked(request: PublicationRequest) -> None:
+    if request.deadline is not None and time.monotonic() >= request.deadline:
+        raise TimeoutError("media publication deadline exceeded")
     current = os.fstat(request.verified_descriptor)
     if (current.st_dev, current.st_ino) != request.verified_inode:
         raise MediaError("verified media descriptor no longer refers to the publication inode")
-    os.replace(
-        request.source_name,
-        request.destination_name,
-        src_dir_fd=request.source_dir_fd,
-        dst_dir_fd=request.destination_dir_fd,
-    )
-    published = os.stat(request.destination_name, dir_fd=request.destination_dir_fd, follow_symlinks=False)
-    if (published.st_dev, published.st_ino) != request.verified_inode:
-        raise MediaError("publication did not expose the verified media inode")
-    os.fsync(request.destination_dir_fd)
+    publication_linked = False
+    destination_fd = -1
+    try:
+        os.link(
+            f"/proc/self/fd/{request.verified_descriptor}",
+            request.destination_name,
+            dst_dir_fd=request.destination_dir_fd,
+            follow_symlinks=True,
+        )
+        publication_linked = True
+        _unlink_if_unchanged(
+            request.source_dir_fd,
+            request.source_name,
+            _cleanup_identity(os.fstat(request.verified_descriptor)),
+            deadline=request.deadline,
+        )
+        destination_fd = os.open(
+            request.destination_name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=request.destination_dir_fd,
+        )
+        destination_stat = os.fstat(destination_fd)
+        if (destination_stat.st_dev, destination_stat.st_ino) != request.verified_inode:
+            raise OSError("publication did not expose the verified media inode")
+        published = os.stat(request.destination_name, dir_fd=request.destination_dir_fd, follow_symlinks=False)
+        if (published.st_dev, published.st_ino) != request.verified_inode:
+            raise OSError("publication pathname does not reference the verified media inode")
+        os.fsync(destination_fd)
+        if request.deadline is not None and time.monotonic() >= request.deadline:
+            raise TimeoutError("media publication deadline exceeded")
+        os.fsync(request.destination_dir_fd)
+        if request.deadline is not None and time.monotonic() >= request.deadline:
+            raise TimeoutError("media publication deadline exceeded")
+        after_fsync = os.fstat(destination_fd)
+        published_after_fsync = os.stat(
+            request.destination_name,
+            dir_fd=request.destination_dir_fd,
+            follow_symlinks=False,
+        )
+        if (after_fsync.st_dev, after_fsync.st_ino) != request.verified_inode or (
+            published_after_fsync.st_dev,
+            published_after_fsync.st_ino,
+        ) != request.verified_inode:
+            raise OSError("publication changed after durability barrier")
+        final_published = os.stat(request.destination_name, dir_fd=request.destination_dir_fd, follow_symlinks=False)
+        if (final_published.st_dev, final_published.st_ino) != request.verified_inode:
+            raise OSError("publication changed after final identity check")
+    except FileExistsError as exc:
+        raise MediaError("destination already exists; refusing to overwrite verified media") from exc
+    except OSError as exc:
+        if publication_linked:
+            try:
+                _remove_failed_canonical(request)
+                os.fsync(request.destination_dir_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_exc:
+                raise MediaError("publication failed and destination cleanup was not proven") from cleanup_exc
+        raise MediaError("verified media publication failed") from exc
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
 
 
 def unpublish_verified_output(request: PublicationRequest) -> None:
@@ -80,17 +225,31 @@ def unpublish_verified_output(request: PublicationRequest) -> None:
     if (destination_stat.st_dev, destination_stat.st_ino) != expected:
         raise MediaError("published destination was replaced; rollback is not proven")
     try:
-        os.replace(
-            request.destination_name,
+        os.link(
+            f"/proc/self/fd/{request.verified_descriptor}",
             request.source_name,
-            src_dir_fd=request.destination_dir_fd,
             dst_dir_fd=request.source_dir_fd,
+            follow_symlinks=True,
+        )
+        restored = os.stat(request.source_name, dir_fd=request.source_dir_fd, follow_symlinks=False)
+        if (restored.st_dev, restored.st_ino) != expected:
+            raise MediaError("rollback source does not reference the verified inode")
+        _unlink_if_unchanged(
+            request.destination_dir_fd,
+            request.destination_name,
+            _cleanup_identity(destination_stat),
+            deadline=request.deadline,
         )
     except FileNotFoundError as exc:
         raise MediaError("verified publication disappeared during rollback") from exc
+    except OSError as exc:
+        raise MediaError("verified publication rollback failed") from exc
     os.fsync(request.destination_dir_fd)
     if request.source_dir_fd != request.destination_dir_fd:
         os.fsync(request.source_dir_fd)
+
+
+MEDIA_HASH_MAX_BYTES = 256 * 1024 * 1024
 
 
 def _tool(name: str) -> str:
@@ -100,15 +259,40 @@ def _tool(name: str) -> str:
     return binary
 
 
-def _sha256_descriptor(descriptor: int) -> str:
-    digest = hashlib.sha256()
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    for chunk in iter(lambda: os.read(descriptor, 1024 * 1024), b""):
-        digest.update(chunk)
-    return digest.hexdigest()
+def _sha256_descriptor(
+    descriptor: int,
+    *,
+    deadline: float | None = None,
+    max_bytes: int = MEDIA_HASH_MAX_BYTES,
+) -> str:
+    file_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size < 0 or file_stat.st_size > max_bytes:
+        raise MediaError("media artifact exceeds hashing limit")
+
+    def hash_once() -> str:
+        digest = hashlib.sha256()
+        total = 0
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        for chunk in iter(lambda: os.read(descriptor, 1024 * 1024), b""):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("media hashing deadline exceeded")
+            total += len(chunk)
+            if total > max_bytes:
+                raise MediaError("media artifact exceeds hashing limit")
+            digest.update(chunk)
+        final_stat = os.fstat(descriptor)
+        if (final_stat.st_dev, final_stat.st_ino) != (file_stat.st_dev, file_stat.st_ino) or final_stat.st_size != file_stat.st_size:
+            raise MediaError("media artifact changed during hashing")
+        return digest.hexdigest()
+
+    first_digest = hash_once()
+    second_digest = hash_once()
+    if first_digest != second_digest:
+        raise MediaError("media artifact content changed between hashing passes")
+    return second_digest
 
 
-def _sha256(path: Path) -> str:
+def _sha256(path: Path, *, deadline: float | None = None) -> str:
     try:
         descriptor = _open_regular_descriptor(path)
     except OSError as exc:
@@ -116,12 +300,18 @@ def _sha256(path: Path) -> str:
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise MediaError(f"media artifact is not a regular file: {path.name}")
-        return _sha256_descriptor(descriptor)
+        return _sha256_descriptor(descriptor, deadline=deadline)
     finally:
         os.close(descriptor)
 
 
-def probe_media(path: str | Path, *, timeout: int = 30, _descriptor: int | None = None) -> dict[str, Any]:
+def probe_media(
+    path: str | Path,
+    *,
+    timeout: int = 30,
+    deadline: float | None = None,
+    _descriptor: int | None = None,
+) -> dict[str, Any]:
     path = Path(path)
     descriptor_owned = _descriptor is None
     if _descriptor is None:
@@ -138,8 +328,14 @@ def probe_media(path: str | Path, *, timeout: int = 30, _descriptor: int | None 
         if file_stat.st_size <= 0:
             raise MediaError(f"media artifact is empty: {path.name}")
         ffprobe = _tool("ffprobe")
+        probe_timeout = float(timeout)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("media probe deadline exceeded")
+            probe_timeout = min(probe_timeout, remaining)
         try:
-            result = subprocess.run(
+            result = _run_bounded_subprocess(
                 [
                     ffprobe,
                     "-v",
@@ -150,21 +346,21 @@ def probe_media(path: str | Path, *, timeout: int = 30, _descriptor: int | None 
                     "json",
                     f"/proc/self/fd/{descriptor}",
                 ],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
+                timeout=probe_timeout,
                 pass_fds=(descriptor,),
+                deadline=deadline,
             )
         except subprocess.TimeoutExpired as exc:
             raise MediaError(f"ffprobe timed out for {path.name}") from exc
+        except subprocess.SubprocessError as exc:
+            raise MediaError(f"ffprobe supervision failed for {path.name}") from exc
         except OSError as exc:
             raise MediaError(f"ffprobe could not start for {path.name}") from exc
         if result.returncode != 0:
             raise MediaError(f"ffprobe rejected {path.name}")
         try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
+            payload = _parse_strict_json(result.stdout)
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise MediaError(f"ffprobe returned malformed JSON for {path.name}") from exc
         if not isinstance(payload, dict):
             raise MediaError(f"ffprobe returned an invalid payload for {path.name}")
@@ -184,7 +380,7 @@ def probe_media(path: str | Path, *, timeout: int = 30, _descriptor: int | None 
         return {
             "path": str(path),
             "size_bytes": file_stat.st_size,
-            "sha256": _sha256_descriptor(descriptor),
+            "sha256": _sha256_descriptor(descriptor, deadline=deadline),
             "duration_seconds": duration,
             "format_name": fmt.get("format_name"),
             "streams": streams,
@@ -200,9 +396,25 @@ def verify_mp4(
     path: str | Path,
     *,
     expected_duration: float | None = None,
+    expected_width: int | None = None,
+    expected_height: int | None = None,
     tolerance: float = 2.0,
+    deadline: float | None = None,
     _descriptor: int | None = None,
 ) -> dict[str, Any]:
+    try:
+        tolerance = float(tolerance)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise MediaError("media duration tolerance is invalid") from exc
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise MediaError("media duration tolerance must be finite and non-negative")
+    if expected_duration is not None:
+        try:
+            expected_duration = float(expected_duration)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise MediaError("expected media duration is invalid") from exc
+        if not math.isfinite(expected_duration) or expected_duration <= 0.0:
+            raise MediaError("expected media duration must be finite and positive")
     path = Path(path)
     if path.suffix.lower() != ".mp4":
         raise MediaError(f"media artifact is not an MP4: {path.name}")
@@ -214,7 +426,7 @@ def verify_mp4(
         header = os.read(descriptor, 12)
         if len(header) < 8 or header[4:8] != b"ftyp":
             raise MediaError(f"media artifact has no MP4 signature: {path.name}")
-        metadata = probe_media(path, _descriptor=descriptor)
+        metadata = probe_media(path, deadline=deadline, _descriptor=descriptor)
     except OSError as exc:
         raise MediaError(f"media artifact is missing: {path.name}") from exc
     finally:
@@ -223,14 +435,19 @@ def verify_mp4(
     video_streams = [stream for stream in metadata["streams"] if isinstance(stream, dict) and stream.get("codec_type") == "video"]
     if not video_streams:
         raise MediaError(f"media artifact has no video stream: {path.name}")
+    video_stream = video_streams[0]
+    width = _positive_int(video_stream.get("width"), "media width")
+    height = _positive_int(video_stream.get("height"), "media height")
     if expected_duration is not None:
-        try:
-            expected = float(expected_duration)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise MediaError("expected media duration is invalid") from exc
-        if not math.isfinite(expected) or abs(metadata["duration_seconds"] - expected) > tolerance:
+        if not math.isfinite(float(metadata["duration_seconds"])) or abs(metadata["duration_seconds"] - expected_duration) > tolerance:
             raise MediaError(f"media duration is outside the expected range: {path.name}")
-    metadata["video_codec"] = video_streams[0].get("codec_name")
+    if expected_width is not None and width != _positive_int(expected_width, "expected media width"):
+        raise MediaError(f"media width does not match the expected profile: {path.name}")
+    if expected_height is not None and height != _positive_int(expected_height, "expected media height"):
+        raise MediaError(f"media height does not match the expected profile: {path.name}")
+    metadata["width"] = width
+    metadata["height"] = height
+    metadata["video_codec"] = video_stream.get("codec_name")
     metadata["valid"] = True
     return metadata
 
@@ -252,12 +469,18 @@ def assemble_verified_clips(
     output: str | Path,
     *,
     expected_duration: float | None = None,
+    expected_width: int | None = None,
+    expected_height: int | None = None,
     timeout: int = 900,
     lease_check: Callable[[], None] | None = None,
     publication_callback: PublicationCallback | None = None,
     expected_clip_sha256: Mapping[str, str] | None = None,
+    expected_clip_durations: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """Concatenate verified clips and atomically publish a verified final MP4."""
+    operation_deadline = time.monotonic() + float(timeout)
+    if operation_deadline <= time.monotonic():
+        raise MediaError("media assembly deadline exceeded")
     if lease_check is not None:
         lease_check()
     clip_paths = [Path(clip) for clip in clips]
@@ -268,26 +491,38 @@ def assemble_verified_clips(
     for clip in clip_paths:
         if lease_check is not None:
             lease_check()
-        verify_mp4(clip)
+        expected_clip_duration = None
+        if expected_clip_durations is not None:
+            expected_clip_duration = expected_clip_durations.get(clip.name)
+            if expected_clip_duration is None:
+                raise MediaError(f"clip duration contract is missing: {clip.name}")
+        verify_mp4(
+            clip,
+            expected_duration=expected_clip_duration,
+            expected_width=expected_width,
+            expected_height=expected_height,
+            tolerance=0.5,
+            deadline=operation_deadline,
+        )
 
     output = Path(output)
     output_parent_fd = _open_directory_no_follow(output.parent, create=True)
     output_parent_path = Path(f"/proc/self/fd/{output_parent_fd}")
     ffmpeg = _tool("ffmpeg")
     temporary_output_name = "assembled.mp4"
+    published_fd = -1
     try:
-        with tempfile.TemporaryDirectory(prefix=f".{output.stem}-", dir=output_parent_path) as temp_dir:
-            temp = Path(temp_dir)
-            temp_dir_fd = os.open(
-                temp.name.rsplit("/", 1)[-1],
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=output_parent_fd,
-            )
+        with _owned_temporary_directory(output_parent_fd, f".{output.stem}-", deadline=operation_deadline) as (temp, temp_dir_fd):
             stable_clips: list[Path] = []
             try:
                 for index, clip in enumerate(clip_paths):
                     if lease_check is not None:
                         lease_check()
+                    expected_clip_duration = None
+                    if expected_clip_durations is not None:
+                        expected_clip_duration = expected_clip_durations.get(clip.name)
+                        if expected_clip_duration is None:
+                            raise MediaError(f"clip duration contract is missing: {clip.name}")
                     source_fd = -1
                     destination_fd = -1
                     try:
@@ -307,11 +542,17 @@ def assemble_verified_clips(
                             dir_fd=temp_dir_fd,
                         )
                         while True:
+                            if operation_deadline is not None and time.monotonic() >= operation_deadline:
+                                raise MediaError("media snapshot deadline exceeded")
+                            if lease_check is not None:
+                                lease_check()
                             chunk = os.read(source_fd, 1024 * 1024)
                             if not chunk:
                                 break
                             view = memoryview(chunk)
                             while view:
+                                if operation_deadline is not None and time.monotonic() >= operation_deadline:
+                                    raise MediaError("media snapshot deadline exceeded")
                                 written = os.write(destination_fd, view)
                                 view = view[written:]
                         os.fsync(destination_fd)
@@ -330,10 +571,17 @@ def assemble_verified_clips(
                             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
                             dir_fd=temp_dir_fd,
                         )
-                        verify_mp4(stable_path, _descriptor=stable_fd)
+                        verify_mp4(
+                            stable_path,
+                            expected_duration=expected_clip_duration,
+                            expected_width=expected_width,
+                            expected_height=expected_height,
+                            _descriptor=stable_fd,
+                            deadline=operation_deadline,
+                        )
                         if expected_clip_sha256 is not None:
                             expected_digest = expected_clip_sha256.get(clip.name)
-                            if expected_digest is None or _sha256_descriptor(stable_fd) != expected_digest:
+                            if expected_digest is None or _sha256_descriptor(stable_fd, deadline=operation_deadline) != expected_digest:
                                 raise MediaError(f"clip hash does not match the generation plan: {clip.name}")
                     finally:
                         if stable_fd >= 0:
@@ -346,7 +594,10 @@ def assemble_verified_clips(
                 if lease_check is not None:
                     lease_check()
                 try:
-                    result = subprocess.run(
+                    remaining = operation_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise MediaError("media assembly deadline exceeded")
+                    result = _run_bounded_subprocess(
                     [
                         ffmpeg,
                         "-hide_banner",
@@ -363,13 +614,14 @@ def assemble_verified_clips(
                         "copy",
                         str(temporary_output),
                     ],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    check=False,
+                    timeout=remaining,
+                    pass_fds=(output_parent_fd,),
+                    deadline=operation_deadline,
                     )
                 except subprocess.TimeoutExpired as exc:
                     raise MediaError("ffmpeg assembly timed out") from exc
+                except subprocess.SubprocessError as exc:
+                    raise MediaError("ffmpeg assembly supervision failed") from exc
                 except OSError as exc:
                     raise MediaError("ffmpeg could not start") from exc
                 if result.returncode != 0:
@@ -383,9 +635,13 @@ def assemble_verified_clips(
                     verified = verify_mp4(
                         temporary_output,
                         expected_duration=expected_duration,
+                        expected_width=expected_width,
+                        expected_height=expected_height,
+                        tolerance=0.5,
                         _descriptor=temporary_output_fd,
+                        deadline=operation_deadline,
                     )
-                    descriptor_digest = _sha256_descriptor(temporary_output_fd)
+                    descriptor_digest = _sha256_descriptor(temporary_output_fd, deadline=operation_deadline)
                     if verified.get("sha256") not in (None, descriptor_digest):
                         raise MediaError("verified media hash does not match its held descriptor")
                     verified["sha256"] = descriptor_digest
@@ -398,6 +654,7 @@ def assemble_verified_clips(
                         verified=verified,
                         verified_descriptor=temporary_output_fd,
                         verified_inode=(verified_stat.st_dev, verified_stat.st_ino),
+                        deadline=operation_deadline,
                     )
                     if lease_check is not None:
                         lease_check()
@@ -412,16 +669,28 @@ def assemble_verified_clips(
                         except Exception as rollback_exc:
                             raise MediaError(f"final publication failed and rollback was not proven: {rollback_exc}") from exc
                         raise
+                    published_fd = os.dup(request.verified_descriptor)
                 finally:
                     os.close(temporary_output_fd)
             finally:
-                os.close(temp_dir_fd)
+                pass
 
-        # ``verified`` was computed from the held descriptor before the
-        # descriptor-relative rename.  Do not reopen ``output`` here: a
-        # post-publication pathname read can observe a replacement after the
-        # lease barrier and commit evidence for the wrong inode.
+        try:
+            published_stat = os.fstat(published_fd)
+            if (published_stat.st_dev, published_stat.st_ino) != request.verified_inode:
+                raise MediaError("published output inode changed during temporary cleanup")
+            published_digest = _sha256_descriptor(published_fd, deadline=operation_deadline)
+            if published_digest != verified.get("sha256"):
+                raise MediaError("published output changed during temporary cleanup")
+        finally:
+            os.close(published_fd)
+            published_fd = -1
+
+        # The evidence is rechecked after temporary cleanup, which can invoke
+        # filesystem callbacks in tests or reconciliation code.
         verified["path"] = str(output)
         return verified
     finally:
+        if published_fd >= 0:
+            os.close(published_fd)
         os.close(output_parent_fd)

@@ -7,7 +7,7 @@ Output: audio/voiceover.mp3 + video_prompts.json + music_prompt.txt
 import json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from package_utils import atomic_write_json, atomic_write_text, read_json_artifact, read_text_artifact
+from package_utils import atomic_write_json, atomic_write_text, read_json_artifact, read_text_artifact, validate_output_profile_contract
 
 
 def load_storyboard(path: str) -> dict:
@@ -21,6 +21,7 @@ def load_script(path: str) -> str:
 def generate_video_prompts(storyboard: dict, visual_style: str = "") -> list[dict]:
     """Generate video generation prompts for each scene (Runway/Pika/Kling ready)."""
     prompts = []
+    profile = validate_output_profile_contract(storyboard, "storyboard")
 
     for scene in storyboard.get('scenes', []):
         sn = scene['scene_number']
@@ -32,16 +33,18 @@ def generate_video_prompts(storyboard: dict, visual_style: str = "") -> list[dic
         # Runway-style prompt
         runway = (
             f"{visual}. {camera}. {visual_style}. "
-            f"Smooth {transition} transition. Professional lighting. High quality."
+            f"Smooth {transition} transition. Professional lighting. High quality. "
+            f"Compose for {profile['aspect_ratio']} {profile['output_profile']} video."
         )
 
         # Pika-style prompt (shorter, more action-oriented)
-        pika = f"{visual}. {camera}. Cinematic quality."
+        pika = f"{visual}. {camera}. Cinematic quality. {profile['aspect_ratio']} frame."
 
         # Kling-style prompt (more detailed)
         kling = (
             f"Scene: {visual}. Camera movement: subtle {camera} with gentle drift. "
-            f"Lighting: professional studio setup. Duration: {dur:.0f}s."
+            f"Lighting: professional studio setup. Duration: {dur:.0f}s. "
+            f"Aspect ratio: {profile['aspect_ratio']}."
         )
 
         prompts.append({
@@ -51,6 +54,9 @@ def generate_video_prompts(storyboard: dict, visual_style: str = "") -> list[dic
             'pika_prompt': pika,
             'kling_prompt': kling,
             'transition': transition,
+            'output_profile': profile['output_profile'],
+            'aspect_ratio': profile['aspect_ratio'],
+            'resolution': profile['resolution'],
         })
 
     return prompts
@@ -109,7 +115,14 @@ def main():
     # Generate video prompts
     video_prompts = generate_video_prompts(storyboard, visual_style)
     vp_path = output_dir / "video_prompts.json"
-    atomic_write_json(vp_path, {'scenes': video_prompts, 'total_scenes': len(video_prompts)})
+    profile = validate_output_profile_contract(storyboard, "storyboard")
+    atomic_write_json(vp_path, {
+        'scenes': video_prompts,
+        'total_scenes': len(video_prompts),
+        'output_profile': profile['output_profile'],
+        'aspect_ratio': profile['aspect_ratio'],
+        'resolution': profile['resolution'],
+    })
 
     # Generate music prompt
     music_prompt = generate_music_prompt(storyboard, tone)

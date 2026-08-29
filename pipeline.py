@@ -19,9 +19,18 @@ Usage:
 import argparse, json, subprocess, sys
 from pathlib import Path
 
-from package_utils import atomic_write_json, clear_generated_artifacts, read_json_artifact, write_package_manifest
+from package_utils import (
+    _run_bounded_subprocess,
+    atomic_write_json,
+    clear_generated_artifacts,
+    read_json_artifact,
+    write_package_manifest,
+)
+from media_assembly import MediaError
+from worker import _artifact_digest, _assemble_verified_output
 
 ENGINES = Path(__file__).resolve().parent / "engines"
+STAGE_TIMEOUT_SECONDS = 900.0
 
 
 def run_stage(name: str, script: str, *args) -> bool:
@@ -31,7 +40,16 @@ def run_stage(name: str, script: str, *args) -> bool:
     print(f"  STAGE: {name}")
     print(f"{'='*60}")
     try:
-        result = subprocess.run(cmd, capture_output=False)
+        result = _run_bounded_subprocess(cmd, timeout=STAGE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        print(f"  ✗ FAILED: stage deadline exceeded ({exc})")
+        return False
+    except subprocess.SubprocessError:
+        print("  ✗ FAILED: bounded subprocess supervision failed")
+        return False
+    except TimeoutError as exc:
+        print(f"  ✗ FAILED: stage deadline exceeded ({exc})")
+        return False
     except OSError as exc:
         print(f"  ✗ FAILED to start: {exc}")
         return False
@@ -122,10 +140,28 @@ def main():
     # Generate thumbnail prompt (always, even with --skip-visuals)
     _generate_thumbnail_prompt(out, brief_json)
 
+    storyboard = read_json_artifact(storyboard_json)
+    manifest_job = {
+        "status": "completed",
+        "brief": str(brief_path),
+        "output_profile": storyboard.get("output_profile", "landscape"),
+        "aspect_ratio": storyboard.get("aspect_ratio", "16:9"),
+    }
+    try:
+        final_media = _assemble_verified_output(out, storyboard)
+    except MediaError as exc:
+        _fail_pipeline(out, brief_path, f"Final media assembly failed: {exc}")
+    if final_media:
+        manifest_job.update({
+            "final_video_sha256": final_media["sha256"],
+            "final_video_plan_sha256": _artifact_digest(out / "clips" / "generation_plan.json"),
+            "final_video_duration_seconds": final_media["duration_seconds"],
+        })
+
     # Write an artifact-derived manifest so CLI output uses the same honesty
     # contract as web jobs.
     try:
-        manifest = write_package_manifest(out, {"status": "completed", "brief": str(brief_path)})
+        manifest = write_package_manifest(out, manifest_job)
     except Exception as exc:
         _fail_pipeline(out, brief_path, f"Failed to write package manifest: {exc}")
         raise
@@ -165,6 +201,9 @@ def _generate_thumbnail_prompt(out: Path, brief_json: Path):
         topic = brief.get('topic', '')
         tone = brief.get('tone', 'professional')
         dur = sb.get('total_duration', 60)
+        aspect_ratio = sb.get('aspect_ratio') or (
+            '9:16' if sb.get('output_profile') == 'vertical' else '16:9'
+        )
         hooks = {
             'educational': f"The TRUTH About {topic[:35]}",
             'professional': f"{topic[:35]} — {int(dur)}s",
@@ -176,7 +215,7 @@ def _generate_thumbnail_prompt(out: Path, brief_json: Path):
         prompt = (
             f"YouTube thumbnail: '{topic[:60]}'. Bold text: '{overlay}'. "
             f"Style: {brief.get('visual_style', 'professional')}. "
-            f"High contrast, vibrant, 4K, 16:9. Maximum 4 words. Clickable."
+            f"High contrast, vibrant, 4K, {aspect_ratio}. Maximum 4 words. Clickable."
         )
         tp = out / "thumbnail_prompt.json"
         atomic_write_json(tp, {'title_overlay': overlay, 'prompt': prompt, 'filename': 'youtube_thumbnail.png'})

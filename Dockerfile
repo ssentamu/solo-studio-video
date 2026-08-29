@@ -32,7 +32,9 @@ COPY job_store.py /app/
 COPY auth_store.py /app/
 COPY media_assembly.py /app/
 COPY audio_generation.py /app/
+COPY music_generation.py /app/
 COPY package_utils.py /app/
+COPY provider_canary.py /app/
 COPY engines/ /app/engines/
 COPY pipeline.py /app/
 COPY frontend/ /app/frontend/

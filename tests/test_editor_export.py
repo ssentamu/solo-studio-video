@@ -59,6 +59,23 @@ class EditorExportTests(unittest.TestCase):
                 {"export": {"fps": 30}},
             )
 
+    def test_fcpxml_uses_vertical_profile_dimensions(self):
+        xml = generate_fcpxml(
+            {
+                "output_profile": "vertical",
+                "aspect_ratio": "9:16",
+                "resolution": "1080x1920",
+                "scenes": [{"scene_number": 1, "duration_seconds": 1}],
+            },
+            {"export": {"fps": 30}},
+        )
+        root = ElementTree.fromstring(xml)
+        format_element = root.find("resources/format")
+        if format_element is None:
+            self.fail("FCPXML format is missing")
+        self.assertEqual(format_element.get("width"), "1080")
+        self.assertEqual(format_element.get("height"), "1920")
+
     def test_fcpxml_uses_accumulated_rounded_frames_and_contiguous_text_resources(self):
         xml = generate_fcpxml(
             {

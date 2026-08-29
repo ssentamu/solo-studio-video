@@ -31,3 +31,25 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Check patch whitespace
         run: git diff --check
+
+  container-smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build exact release image
+        run: docker build --pull=false --tag solo-studio-video:${{ github.sha }} .
+      - name: Smoke exact image without network or credentials
+        run: |
+          docker run --rm --network none --env SOLO_STUDIO_REQUIRE_API_TOKEN=0 --entrypoint sh solo-studio-video:${{ github.sha }} -ceu '
+            command -v ffmpeg >/dev/null
+            command -v ffprobe >/dev/null
+            command -v higgsfield >/dev/null
+            python -m py_compile api.py auth_store.py audio_generation.py job_store.py media_assembly.py music_generation.py package_utils.py pipeline.py provider_canary.py runtime_init.py worker.py engines/*.py
+            python -c "import api, audio_generation, job_store, media_assembly, music_generation, package_utils, pipeline, provider_canary, worker"
+            python provider_canary.py > /tmp/provider-canary.json
+            grep -q '"live": false' /tmp/provider-canary.json
+            grep -q '"network_called": false' /tmp/provider-canary.json
+            grep -q '"status": "dry_run"' /tmp/provider-canary.json
+          '

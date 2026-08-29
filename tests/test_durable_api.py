@@ -1,8 +1,10 @@
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -38,6 +40,46 @@ class DurableApiTests(unittest.TestCase):
             setattr(api, key, value)
         self.tmp.cleanup()
 
+    def test_zip_walker_excludes_private_generation_and_backup_directories(self):
+        root = Path(self.tmp.name) / "download-root"
+        root.mkdir()
+        (root / "public.txt").write_text("public", encoding="utf-8")
+        for name in (".clips.generation-left", ".clips.previous-left"):
+            private = root / name
+            private.mkdir()
+            (private / "scene_01.mp4").write_bytes(b"private")
+        entries = []
+        for archive_name, descriptor, _size in api._iter_zip_files_no_follow(root):
+            try:
+                entries.append(archive_name)
+            finally:
+                os.close(descriptor)
+        self.assertEqual(entries, ["public.txt"])
+
+    def test_zip_snapshot_rejects_file_growth_beyond_captured_size_and_limit(self):
+        root = Path(self.tmp.name) / "download-root"
+        root.mkdir()
+        payload = root / "growth.bin"
+        payload.write_bytes(b"too-large")
+        descriptor = os.open(payload, os.O_RDONLY)
+
+        def captured_file():
+            yield "growth.bin", descriptor, 1
+
+        with patch("api._iter_zip_files_no_follow", return_value=captured_file()), patch.object(
+            api, "MAX_DOWNLOAD_BYTES", 1
+        ):
+            with self.assertRaises(api.HTTPException) as raised:
+                api._snapshot_zip_hashes(root, (os.stat(root).st_dev, os.stat(root).st_ino))
+        self.assertEqual(raised.exception.status_code, 409)
+
+    def test_template_profile_validation_rejects_malformed_secondary_metadata(self):
+        with self.assertRaises(ValueError):
+            api.validate_output_profile_contract(
+                {"output_profile": "vertical", "aspect_ratio": False},
+                "template",
+            )
+
     def test_sqlite_route_is_idempotent_and_does_not_duplicate_jobs(self):
         payload = {
             "topic": "Durable jobs",
@@ -70,6 +112,10 @@ class DurableApiTests(unittest.TestCase):
         response = self.client.get("/api/jobs/private-fields")
         self.assertEqual(response.status_code, 200)
         payload = response.json()
+        self.assertEqual(
+            [stage["stage_name"] for stage in payload["stages"]],
+            list(job_store.DEFAULT_STAGE_NAMES),
+        )
         for key in (
             "lease_owner", "lease_expires_at", "retry_count", "max_retries",
             "next_attempt_at", "run_id", "attempt", "source_digest", "output_dir",
@@ -135,7 +181,13 @@ class DurableApiTests(unittest.TestCase):
         brief = "topic: current run\n"
         (run_dir / "brief.yaml").write_text(brief, encoding="utf-8")
         source_digest = hashlib.sha256(brief.encode("utf-8")).hexdigest()
-        job_store.update_fields(job_id, {"source_digest": source_digest}, worker_id="worker-a", path=api.DATABASE_FILE)
+        job_store.update_fields(
+            job_id,
+            {"source_digest": source_digest},
+            worker_id="worker-a",
+            run_id=claim.job["run_id"],
+            path=api.DATABASE_FILE,
+        )
         fixtures = {
             "creative_brief.json": "{}",
             "script.txt": "script",
@@ -179,7 +231,7 @@ class DurableApiTests(unittest.TestCase):
         self.assertEqual(stale_response.status_code, 200)
         self.assertEqual(stale_response.json()["package_status"], "not_started")
 
-    def test_legacy_imported_completed_job_keeps_flat_package_access(self):
+    def test_legacy_import_rejects_unverifiable_completed_job(self):
         job_id = "legacy-completed"
         source = Path(self.tmp.name) / "jobs.json"
         source.write_text(json.dumps({
@@ -195,23 +247,23 @@ class DurableApiTests(unittest.TestCase):
         try:
             job_store.APP_DIR = Path(self.tmp.name) / "legacy-app"
             api.OUTPUT_ROOT = job_store.APP_DIR / "output"
-            flat_root = api.OUTPUT_ROOT / job_id
-            flat_root.mkdir(parents=True)
-            (flat_root / "creative_brief.json").write_text("{}", encoding="utf-8")
-            self.assertEqual(job_store.import_jobs_json_once(source, path=api.DATABASE_FILE), 1)
-            imported = job_store.get_job(job_id, path=api.DATABASE_FILE)
-            self.assertIsNotNone(imported)
-            assert imported is not None
-            self.assertEqual(imported["run_id"], "legacy-import")
-            response = self.client.get(f"/api/jobs/{job_id}")
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.json()["package_status"], "research_only")
-            download = self.client.get(f"/api/jobs/{job_id}/download")
-            self.assertEqual(download.status_code, 200)
-            self.assertEqual(download.headers["content-type"], "application/zip")
+            with self.assertRaises(job_store.InvalidStoreState):
+                job_store.import_jobs_json_once(source, path=api.DATABASE_FILE)
+            self.assertEqual(job_store.list_jobs(path=api.DATABASE_FILE), [])
         finally:
             job_store.APP_DIR = original_app_dir
             api.OUTPUT_ROOT = original_output_root
+
+    def test_sqlite_missing_topic_is_normalized_for_api_response(self):
+        job_store.create_job(
+            "missing-topic",
+            {"target_audience": "developers"},
+            output_dir=api.OUTPUT_ROOT / "missing-topic",
+            path=api.DATABASE_FILE,
+        )
+        response = self.client.get("/api/jobs/missing-topic")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["topic"], "")
 
 
 if __name__ == "__main__":

@@ -417,6 +417,13 @@
           </select>
         </div>
         <div class="form-group">
+          <label>Output Profile</label>
+          <select id="output-profile">
+            <option value="landscape">Landscape 16:9</option>
+            <option value="vertical">Vertical 9:16</option>
+          </select>
+        </div>
+        <div class="form-group">
           <label>Key Messages (one per line)</label>
           <textarea id="messages" placeholder="AI handles 70% of junior dev tasks&#10;Cost drops to 1/10th&#10;Teams ship 3x faster"></textarea>
         </div>
@@ -429,7 +436,7 @@
           <input type="text" id="cta" placeholder="e.g. Subscribe for weekly deep dives">
         </div>
         <button type="submit" class="btn" id="submit-btn">
-          <span>Generate Video Package</span>
+          <span>Generate Video</span>
         </button>
       </form>
     </div>
@@ -464,6 +471,7 @@
 
       <!-- Pipeline steps -->
       <div class="pipeline" id="pipeline-steps">
+        <div class="pipeline-step"></div>
         <div class="pipeline-step"></div>
         <div class="pipeline-step"></div>
         <div class="pipeline-step"></div>
@@ -612,6 +620,7 @@ document.getElementById('brief-form').addEventListener('submit', async (e) => {
     duration_minutes: parseFloat(document.getElementById('duration').value),
     platform: document.getElementById('platform').value,
     tone: document.getElementById('tone').value,
+    output_profile: document.getElementById('output-profile').value,
     key_messages: messages,
     visual_style: document.getElementById('visual-style').value,
     call_to_action: document.getElementById('cta').value,
@@ -634,13 +643,18 @@ document.getElementById('brief-form').addEventListener('submit', async (e) => {
     alert('Error: ' + err.message);
   } finally {
     btn.disabled = false;
-    btn.innerHTML = '<span>Generate Video Package</span>';
+    btn.innerHTML = '<span>Generate Video</span>';
   }
 });
 
 // ── Poll job status ──
 function pollJob() {
   if (!currentJobId) return;
+
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
 
   pollTimer = setInterval(async () => {
     try {
@@ -649,11 +663,13 @@ function pollJob() {
       const job = await res.json();
       updateJobView(job);
 
-      if (job.status === 'completed') {
+      if (job.status === 'completed' || job.status === 'editor_package') {
         clearInterval(pollTimer);
+        pollTimer = null;
         showDownloadView(job);
-      } else if (job.status === 'failed') {
+      } else if (job.status === 'failed' || job.status === 'cancelled') {
         clearInterval(pollTimer);
+        pollTimer = null;
       }
 
       // Also update recent jobs in background
@@ -677,7 +693,7 @@ function updateJobView(job) {
 
   // Spinner
   const spin = document.getElementById('stage-spinner');
-  spin.style.display = job.status === 'completed' || job.status === 'failed' ? 'none' : 'inline-block';
+  spin.style.display = job.status === 'completed' || job.status === 'editor_package' || job.status === 'failed' || job.status === 'cancelled' ? 'none' : 'inline-block';
 
   // Stats
   document.getElementById('stat-format').textContent = job.format || '—';
@@ -686,7 +702,9 @@ function updateJobView(job) {
   document.getElementById('package-status-note').textContent = packageStatusNote(job.package_status || 'not_started');
 
   // Pipeline steps
-  const stages = ['research', 'script', 'visuals', 'voiceover', 'video_prompts', 'video_generation', 'music', 'captions', 'editor_export', 'assembly'];
+  const stages = Array.isArray(job.stages) && job.stages.length
+    ? job.stages.map(stage => stage && stage.stage_name).filter(Boolean)
+    : ['research', 'script', 'visuals', 'voiceover', 'video_prompts', 'video_generation', 'music', 'editing', 'captions', 'editor_export', 'assembly'];
   const currentIdx = stages.indexOf(job.stage);
   const pipeline = document.getElementById('pipeline-steps');
   if (pipeline.children.length !== stages.length) {
@@ -695,7 +713,7 @@ function updateJobView(job) {
   const steps = pipeline.children;
   for (let i = 0; i < steps.length; i++) {
     steps[i].className = 'pipeline-step';
-    if (job.status === 'completed') {
+    if (job.status === 'completed' || job.status === 'editor_package') {
       steps[i].classList.add('done');
     } else if (currentIdx >= 0 && i < currentIdx) {
       steps[i].classList.add('done');
@@ -729,9 +747,10 @@ function formatStage(stage) {
     video_prompts: 'Preparing video generation prompts...',
     video_generation: 'Preparing clip generation plan...',
     music: 'Composing background music...',
+    editing: 'Editing scenes into the final timeline...',
     captions: 'Generating captions...',
     editor_export: 'Exporting editor project file...',
-    assembly: 'Assembling final package...',
+    assembly: 'Verifying final MP4 or editor package...',
     done: 'Complete!',
   };
   return names[stage] || stage;
@@ -767,20 +786,24 @@ function showDownloadView(job) {
   ).join('');
 
   // Stats
-  document.getElementById('download-stats').innerHTML = `
-    <div class="stat">
-      <div class="stat-value">${job.scenes || '—'}</div>
-      <div class="stat-label">Scenes</div>
-    </div>
-    <div class="stat">
-      <div class="stat-value">${job.chapters || '—'}</div>
-      <div class="stat-label">Chapters</div>
-    </div>
-    <div class="stat">
-      <div class="stat-value">${Math.round(job.duration_seconds / 60) || '—'}m</div>
-      <div class="stat-label">Duration</div>
-    </div>
-  `;
+  const stats = [
+    [job.scenes || '—', 'Scenes'],
+    [job.chapters || '—', 'Chapters'],
+    [`${Math.round(job.duration_seconds / 60) || '—'}m`, 'Duration'],
+  ];
+  const statsContainer = document.getElementById('download-stats');
+  statsContainer.replaceChildren(...stats.map(([value, label]) => {
+    const stat = document.createElement('div');
+    stat.className = 'stat';
+    const statValue = document.createElement('div');
+    statValue.className = 'stat-value';
+    statValue.textContent = String(value);
+    const statLabel = document.createElement('div');
+    statLabel.className = 'stat-label';
+    statLabel.textContent = label;
+    stat.append(statValue, statLabel);
+    return stat;
+  }));
 
   const downloadBtn = document.getElementById('download-btn');
   downloadBtn.dataset.jobId = job.id;
@@ -833,11 +856,13 @@ async function loadJobStatus(jobId) {
     const job = await res.json();
     updateJobView(job);
 
-    if (job.status === 'completed') {
+    if (job.status === 'completed' || job.status === 'editor_package') {
       showDownloadView(job);
       showView('download');
     } else if (job.status === 'running' || job.status === 'queued') {
       pollJob();
+    } else if (job.status === 'cancelled') {
+      document.getElementById('back-btn-container').classList.remove('hidden');
     } else {
       document.getElementById('back-btn-container').classList.remove('hidden');
     }
@@ -862,10 +887,11 @@ function packageStatusNote(status) {
     research_only: 'Package status: research_only — creative brief exists, but script/video package is incomplete.',
     script_package: 'Package status: script_package — script and storyboard exist, but video/editor artifacts are incomplete.',
     prompt_package_only: 'Package status: prompt_package_only — prompts exist, but editor timeline and verified clips/final MP4 do not.',
-    editor_package: 'Package status: editor_package — editor-ready package exists; real clips/final MP4 are not verified.',
+    editor_package: 'Package status: editor_package — editor package exists; finished MP4 is not verified.',
     clips_generated: 'Package status: clips_generated — scene MP4 clips are verified; final assembled video is not verified.',
     final_video_ready: 'Package status: final_video_ready — final MP4 is verified.',
     failed: 'Package status: failed — partial artifacts may still be present.',
+    cancelled: 'Package status: cancelled — no further processing will occur.',
   };
   return notes[status] || ('Package status: ' + status);
 }
@@ -944,6 +970,7 @@ function selectTemplate(templateId, el) {
       document.getElementById('duration').value = t.duration_minutes;
       document.getElementById('platform').value = t.platform;
       document.getElementById('tone').value = t.tone;
+      document.getElementById('output-profile').value = t.output_profile || 'landscape';
       document.getElementById('messages').value = (t.key_messages || []).join('\n');
       document.getElementById('visual-style').value = t.visual_style || '';
       document.getElementById('cta').value = t.call_to_action || '';

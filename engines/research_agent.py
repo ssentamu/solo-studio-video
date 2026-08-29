@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from dataclasses import dataclass, field, asdict
 from typing import Optional
-from package_utils import atomic_write_json, read_json_artifact, read_text_artifact
+from package_utils import atomic_write_json, read_json_artifact, read_text_artifact, validate_output_profile_contract
 
 @dataclass
 class CreativeBrief:
@@ -23,6 +23,8 @@ class CreativeBrief:
     competitive_notes: str = ""
     visual_style: str = ""
     call_to_action: str = ""
+    output_profile: str = "landscape"
+    aspect_ratio: str = "16:9"
 
 
 def load_input(brief_path: str) -> dict:
@@ -46,6 +48,7 @@ def generate_brief(raw: dict) -> CreativeBrief:
     cta = raw.get('call_to_action', '')
     visual = raw.get('visual_style', '')
     refs = raw.get('reference_urls', [])
+    profile = validate_output_profile_contract(raw, "creative brief")
 
     # Build enriched brief
     brief = CreativeBrief(
@@ -60,6 +63,8 @@ def generate_brief(raw: dict) -> CreativeBrief:
             f"No direct competitors identified. Focus on original angle for '{topic}'."),
         visual_style=visual or infer_visual_style(tone, platform),
         call_to_action=cta or infer_cta(platform, topic),
+        output_profile=profile["output_profile"],
+        aspect_ratio=profile["aspect_ratio"],
     )
     return brief
 

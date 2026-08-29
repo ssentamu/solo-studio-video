@@ -76,7 +76,9 @@ class DeploymentSafetyTests(unittest.TestCase):
                 "auth_store.py",
                 "media_assembly.py",
                 "audio_generation.py",
+                "music_generation.py",
                 "package_utils.py",
+                "provider_canary.py",
                 "engines/",
                 "pipeline.py",
                 "frontend/",
@@ -86,6 +88,78 @@ class DeploymentSafetyTests(unittest.TestCase):
         for source in sources:
             with self.subTest(source=source):
                 self.assertFalse(self.dockerignore_excludes(source))
+
+    def test_authenticated_preflight_builds_curl_config_from_token_file(self):
+        self.assertNotIn("SOLO_...KEN", self.deploy)
+        self.assertIn('os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)', self.deploy)
+        self.assertIn('os.fstat(token_fd)', self.deploy)
+        self.assertIn('os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)', self.deploy)
+        self.assertIn('"$SOLO_STUDIO_API_TOKEN_FILE" "$curl_config"', self.deploy)
+        self.assertIn('/run/secrets/solo_studio_api_token', self.deploy)
+        self.assertIn('--config "$token_config"', self.deploy)
+        forbidden_token_expansion = "Authorization: Bearer $" + "SOLO_STUDIO_API_TOKEN"
+        self.assertNotIn(forbidden_token_expansion, self.deploy)
+
+    def test_ephemeral_token_is_cleaned_on_early_validation_failure(self):
+        fallback = self.deploy.index('if [ ! -e "$SOLO_STUDIO_API_TOKEN_FILE" ]')
+        early_trap = self.deploy.index("trap cleanup_ephemeral_api_token EXIT")
+        self.assertLess(early_trap, fallback)
+        self.assertIn('rm -f -- "$SOLO_STUDIO_API_TOKEN_FILE"', self.deploy)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = os.environ.copy()
+            env.update({
+                "TMPDIR": str(root),
+                "HOME": str(root),
+                "SOLO_STUDIO_API_TOKEN": "synthetic-token",
+                "SOLO_STUDIO_API_TOKEN_FILE": str(root / "missing-token"),
+                "SOLO_STUDIO_ENABLE_HIGGSFIELD": "invalid",
+            })
+            result = subprocess.run(
+                ["bash", str(ROOT / "deploy-traefik.sh")],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_ephemeral_token_partial_mktemp_failure_is_cleaned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_mktemp = fake_bin / "mktemp"
+            fake_mktemp.write_text(
+                "#!/bin/sh\n"
+                "set -eu\n"
+                "template=${1:?missing template}\n"
+                "partial=${template%XXXXXX}partial\n"
+                "(umask 022; : > \"$partial\")\n"
+                "exit 17\n"
+            )
+            fake_mktemp.chmod(0o755)
+            env = os.environ.copy()
+            env.update({
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "TMPDIR": str(root),
+                "HOME": str(root),
+                "SOLO_STUDIO_API_TOKEN": "synthetic-token",
+                "SOLO_STUDIO_API_TOKEN_FILE": str(root / "missing-token"),
+            })
+            result = subprocess.run(
+                ["bash", str(ROOT / "deploy-traefik.sh")],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 17)
+            self.assertEqual(list(root.iterdir()), [fake_bin])
+            self.assertEqual(list(fake_bin.iterdir()), [fake_mktemp])
 
     def test_deployment_removals_are_verified_and_unknown_inspect_fails_closed(self):
         self.assertEqual(self.deploy.count('docker rm -f'), 1)
@@ -102,6 +176,9 @@ class DeploymentSafetyTests(unittest.TestCase):
         self.assertIn("PREFLIGHT_DIRS_SAFE_TO_DELETE=0", self.deploy)
         self.assertIn("clear_preflight_dirs", self.deploy)
         self.assertIn("remove_container_and_verify \"$APP_NAME\"", self.deploy)
+
+    def test_higgsfield_default_resolution_matches_verified_media_contract(self):
+        self.assertIn("SOLO_STUDIO_HIGGSFIELD_RESOLUTION=${SOLO_STUDIO_HIGGSFIELD_RESOLUTION:-1080p}", self.deploy)
 
     def test_replacement_attempt_is_reconciled_before_rollback_mutation(self):
         self.assertIn("replacement_started=1", self.deploy)
@@ -210,9 +287,13 @@ class DeploymentSafetyTests(unittest.TestCase):
             elif state_database:
                 app_dir = root / "appdir"
                 (app_dir / "state").mkdir(parents=True)
-                with sqlite3.connect(app_dir / "state" / "solo_studio.sqlite3") as database:
+                database = sqlite3.connect(app_dir / "state" / "solo_studio.sqlite3")
+                try:
                     database.execute("CREATE TABLE marker (value TEXT)")
                     database.execute("INSERT INTO marker VALUES ('real-db')")
+                    database.commit()
+                finally:
+                    database.close()
                 app_dir_setup = f"APP_DIR={app_dir}\n"
 
             start = self.deploy.index("#!/bin/bash")
@@ -316,8 +397,11 @@ class DeploymentSafetyTests(unittest.TestCase):
         self.assertIn("RESULT=1", output)
         state_line = next(line for line in output.splitlines() if line.startswith("STATE="))
         seeded = Path(state_line.removeprefix("STATE=")) / "solo_studio.sqlite3"
-        with sqlite3.connect(seeded) as database:
+        database = sqlite3.connect(seeded)
+        try:
             self.assertEqual(database.execute("SELECT value FROM marker").fetchone(), ("real-db",))
+        finally:
+            database.close()
 
     def test_preflight_rejects_fifo_state_jobs_without_blocking(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -346,11 +430,15 @@ class DeploymentSafetyTests(unittest.TestCase):
         self.assertIn("RESULT=1", output)
         self.assertIn("EXEC", events)
         self.assertIn("RM", events)
-        self.assertFalse(any(event.startswith("CLEANUP") for event in events), events)
         state_line = next(line for line in output.splitlines() if line.startswith("STATE="))
         output_line = next(line for line in output.splitlines() if line.startswith("OUTPUT="))
-        self.assertTrue(Path(state_line.removeprefix("STATE=")).is_dir(), output)
-        self.assertTrue(Path(output_line.removeprefix("OUTPUT=")).is_dir(), output)
+        state_path = state_line.removeprefix("STATE=")
+        output_path = output_line.removeprefix("OUTPUT=")
+        cleanup_events = [event for event in events if event.startswith("CLEANUP")]
+        self.assertTrue(cleanup_events, events)
+        self.assertTrue(all(state_path not in event and output_path not in event for event in cleanup_events), events)
+        self.assertTrue(Path(state_path).is_dir(), output)
+        self.assertTrue(Path(output_path).is_dir(), output)
 
 
 if __name__ == "__main__":

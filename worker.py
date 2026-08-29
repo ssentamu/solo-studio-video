@@ -4,14 +4,16 @@ Solo Studio Worker — Background pipeline executor.
 Watches jobs.json for queued jobs, runs the pipeline, updates status.
 Uses a simple polling loop (no Redis dependency — standalone).
 """
-import hashlib, json, math, os, re, signal, subprocess, sys, tempfile, threading, time, shutil
+import json, math, os, re, signal, stat, subprocess, sys, tempfile, threading, time, shutil
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Callable
 
 import job_store
+import package_utils
 from audio_generation import AudioGenerationError, generate_voiceover
 from media_assembly import MediaError, PublicationRequest, assemble_verified_clips, publish_verified_output, unpublish_verified_output
+from music_generation import MusicGenerationError, generate_music
 from package_utils import (
     _open_directory_no_follow,
     _open_regular_descriptor,
@@ -25,28 +27,68 @@ from package_utils import (
     read_json_object,
     read_text_artifact,
     resolve_current_attempt_output_dir,
+    validate_output_profile_contract,
     update_json_file,
     write_package_manifest,
     remove_matching_files,
 )
 
 APP_DIR = Path(__file__).resolve().parent
-OUTPUT_ROOT = APP_DIR / "output"
 JOBS_FILE = Path(os.getenv("SOLO_STUDIO_JOBS_FILE", str(APP_DIR / "jobs.json")))
 DATABASE_FILE = Path(os.getenv("SOLO_STUDIO_DATABASE_FILE", str(APP_DIR / "state" / "solo_studio.sqlite3")))
 DATABASE_CONFIGURED = bool(os.getenv("SOLO_STUDIO_DATABASE_FILE", "").strip())
+OUTPUT_ROOT = job_store._output_root_for_database(DATABASE_FILE) if DATABASE_CONFIGURED else APP_DIR / "output"
 ENGINES_DIR = APP_DIR / "engines"
 PIPELINE = APP_DIR / "pipeline.py"
 
 POLL_INTERVAL = 2  # seconds
-LEASE_SECONDS = int(os.getenv("SOLO_STUDIO_WORKER_LEASE_SECONDS", "900"))
+
+
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(minimum, min(maximum, value))
+
+
+LEASE_SECONDS = _bounded_int_env("SOLO_STUDIO_WORKER_LEASE_SECONDS", 900, 1, 24 * 60 * 60)
 WORKER_ID = os.getenv("HOSTNAME", "solo-worker") + ":" + str(os.getpid())
 CURRENT_WORKER_ID: str | None = None
+CURRENT_RUN_ID: str | None = None
 
 
 def _safe_error(value: object) -> str:
-    text = re.sub(r"https?://\S+", "[provider-url-redacted]", str(value or ""))
-    text = re.sub(r"(?i)(api[_-]?key|token|secret|password)=\S+", r"\1=[redacted]", text)
+    if isinstance(value, BaseException):
+        return value.__class__.__name__
+    text = str(value or "")
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", " ", text)
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    text = re.sub(r"(?i)https?://\S+", "[provider-url-redacted]", text)
+    text = re.sub(r"(?i)\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", "[credential-redacted]", text)
+    text = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [redacted]", text)
+    secret_key = r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|secret|password)"
+    quoted_value = r'''(?P<value_quote>["'])(?:\\.|(?! (?P=value_quote)).)*(?P=value_quote)'''.replace("(?! ", "(?!")
+    text = re.sub(
+        r'''(?i)(["'])(''' + secret_key + r''')\1\s*:\s*''' + quoted_value,
+        "[redacted]",
+        text,
+    )
+    text = re.sub(
+        r'''(?i)\b(''' + secret_key + r''')\b\s*[:=]\s*''' + quoted_value,
+        r"\1=[redacted]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(" + secret_key + r")\b\s*[:=]\s*(?![\"'])[^\n,;]+",
+        r"\1=[redacted]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|secret|password)\b(?:\s*[:=]|\s+)\s*[\"']?[^,\s\"']+[\"']?",
+        r"\1=[redacted]",
+        text,
+    )
     return text[:1000]
 
 
@@ -67,13 +109,13 @@ def _write_failure_reconciliation_marker(job_id: str, out: Path, job: dict, erro
         os.close(directory_fd)
         atomic_write_json(out / "failure_reconciliation.json", marker)
     except Exception as exc:
-        raise RuntimeError(f"could not persist failure reconciliation marker: {exc}") from exc
+        raise RuntimeError(f"could not persist failure reconciliation marker: {exc.__class__.__name__}") from exc
 
 
 def load_jobs() -> dict:
     if DATABASE_CONFIGURED:
         return {job["id"]: job for job in job_store.list_jobs(path=DATABASE_FILE)}
-    jobs = read_json_object(JOBS_FILE)
+    jobs = read_json_object(JOBS_FILE, lock=False)
     if not isinstance(jobs, dict):
         raise ValueError("legacy jobs store must contain an object")
     for key, job in jobs.items():
@@ -81,6 +123,8 @@ def load_jobs() -> dict:
             raise ValueError("legacy jobs store entries must be objects")
         if not isinstance(job.get("id"), str) or job_store._validate_job_id(job["id"]) != job_store._validate_job_id(key):
             raise ValueError("legacy jobs store entries must contain a matching id")
+        job_store._validate_legacy_record(key, job, output_root=OUTPUT_ROOT)
+        job.setdefault("topic", "")
     return jobs
 
 
@@ -92,16 +136,41 @@ def update_job(job_id: str, **kwargs):
             translated["current_stage"] = translated.pop("stage")
         if "error" in translated:
             translated["error_message"] = translated.pop("error")
-        job_store.update_fields(job_id, translated, worker_id=CURRENT_WORKER_ID, path=DATABASE_FILE)
+        if (
+            not isinstance(CURRENT_WORKER_ID, str)
+            or not CURRENT_WORKER_ID.strip()
+            or not isinstance(CURRENT_RUN_ID, str)
+            or not CURRENT_RUN_ID.strip()
+        ):
+            raise job_store.LeaseLost(f"job {job_id} has no active run identity")
+        job_store.update_fields(
+            job_id,
+            translated,
+            worker_id=CURRENT_WORKER_ID,
+            run_id=CURRENT_RUN_ID,
+            path=DATABASE_FILE,
+        )
         return
 
     def apply_update(jobs: dict) -> dict:
         if job_id in jobs:
             if not isinstance(jobs[job_id], dict):
                 raise ValueError("legacy jobs store entries must be objects")
-            if jobs[job_id].get("status") == "cancelled":
-                raise job_store.LeaseLost(f"job {job_id} was cancelled")
-            jobs[job_id].update(kwargs)
+            current = jobs[job_id]
+            job_store._validate_legacy_record(job_id, current, output_root=OUTPUT_ROOT)
+            if current.get("status") in {"completed", "editor_package", "failed", "cancelled"}:
+                raise job_store.LeaseLost(f"job {job_id} is terminal")
+            candidate = dict(current)
+            candidate.update(kwargs)
+            if candidate.get("status") in {"completed", "editor_package"}:
+                if candidate.get("stage") != "done" or candidate.get("progress") != 1.0 or not candidate.get("completed_at"):
+                    raise job_store.InvalidStoreState("legacy terminal package update requires done stage and full progress")
+                if candidate["status"] == "completed":
+                    job_store._validate_final_video_payload(candidate)
+                elif candidate.get("package_status") != "editor_package":
+                    raise job_store.InvalidStoreState("legacy editor package update requires editor package evidence")
+            job_store._validate_legacy_record(job_id, candidate, output_root=OUTPUT_ROOT)
+            jobs[job_id] = candidate
         return jobs
 
     update_json_file(JOBS_FILE, apply_update)
@@ -123,6 +192,7 @@ def _fence_lease(job_id: str) -> None:
         job_store.heartbeat(
             job_id,
             CURRENT_WORKER_ID or WORKER_ID,
+            run_id=CURRENT_RUN_ID,
             lease_seconds=LEASE_SECONDS,
             path=DATABASE_FILE,
         )
@@ -141,7 +211,7 @@ def _run_with_lease_heartbeat(job_id: str, operation: Callable[[], object]) -> o
                 _fence_lease(job_id)
             except job_store.JobStoreError as exc:
                 lost.set()
-                print(f"  [{job_id}] Lease heartbeat failed: {exc}", file=sys.stderr)
+                print(f"  [{job_id}] Lease heartbeat failed: {exc.__class__.__name__}", file=sys.stderr)
                 return
 
     thread = threading.Thread(target=renew, name=f"artifact-lease-{job_id}", daemon=True)
@@ -162,17 +232,10 @@ def _run_with_lease_heartbeat(job_id: str, operation: Callable[[], object]) -> o
 
 
 def _artifact_digest(path: Path) -> str:
-    descriptor = _open_regular_descriptor(path)
-    try:
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-        return digest.hexdigest()
-    finally:
-        os.close(descriptor)
+    digest = _sha256_regular_file(path)
+    if digest is None:
+        raise OSError("artifact exceeds the verification size limit or is unreadable")
+    return digest
 
 
 def _run_provenance_path(output_root: Path) -> Path:
@@ -300,7 +363,15 @@ def _provenance_matches(
                 }
             except OSError:
                 return False
-            if unexpected_media or clip_names != expected_clip_names:
+            plan_info = package_utils._generation_plan_info(output_root)
+            if not plan_info.get("valid"):
+                return False
+            plan_status = plan_info.get("status")
+            if plan_status == "dry_run":
+                if any(scene.get("status") != "dry_run" for scene in scenes) or unexpected_media or clip_names:
+                    return False
+                return True
+            if plan_status != "completed" or unexpected_media or clip_names != expected_clip_names:
                 return False
             for scene in scenes:
                 if not isinstance(scene, dict) or scene.get("status") not in {"downloaded", "verified"}:
@@ -327,6 +398,18 @@ def _stage_key(name: str) -> str:
         "Editing": "editing",
         "Editor Export": "editor_export",
     }.get(name, name.strip().lower().replace(" ", "_"))
+
+
+def _update_auxiliary_stage(job_id: str, stage: str, status: str) -> None:
+    if DATABASE_CONFIGURED:
+        job_store.update_stage(
+            job_id,
+            stage,
+            status,
+            worker_id=CURRENT_WORKER_ID or WORKER_ID,
+            run_id=CURRENT_RUN_ID or "",
+            path=DATABASE_FILE,
+        )
 
 
 def _cancelled_cleanup(job_id: str, output_root: Path) -> bool:
@@ -415,18 +498,50 @@ def _resume_artifacts_valid(
             if not _valid_scene_records(payload.get("scenes"), number_key="scene_number"):
                 return False
         elif relative == "clips/generation_plan.json":
+            plan_info = package_utils._generation_plan_info(output_root)
+            if not plan_info.get("valid"):
+                return False
             scenes = payload.get("scenes")
             total_scenes = payload.get("total_scenes")
             if (
-                payload.get("status") != "completed"
+                payload.get("status") not in {"completed", "dry_run"}
                 or not _valid_scene_records(scenes, number_key="scene_number")
                 or not isinstance(scenes, list)
                 or isinstance(total_scenes, bool)
                 or not isinstance(total_scenes, int)
                 or total_scenes != len(scenes)
-                or any(scene.get("status") not in {"downloaded", "verified"} for scene in scenes)
+                or any(scene.get("status") not in {"downloaded", "verified", "dry_run"} for scene in scenes)
             ):
                 return False
+            try:
+                clip_directory_entries = set(os.listdir(output_root / "clips"))
+                clip_names = {
+                    name for name in clip_directory_entries
+                    if re.fullmatch(r"scene_[0-9]+\.mp4", name)
+                }
+                unexpected_media = {
+                    name for name in clip_directory_entries
+                    if name.lower().endswith(".mp4") and name not in clip_names
+                }
+            except OSError:
+                return False
+            plan_status = plan_info.get("status")
+            if plan_status == "dry_run":
+                if clip_names or unexpected_media:
+                    return False
+                return True
+            expected_clip_names = {f"scene_{scene['scene_number']:02d}.mp4" for scene in scenes}
+            if unexpected_media or clip_names != expected_clip_names:
+                return False
+            expected_hashes = plan_info.get("scene_hashes", {})
+            for scene in scenes:
+                number = scene.get("scene_number")
+                expected_hash = expected_hashes.get(number)
+                if not isinstance(expected_hash, str):
+                    return False
+                clip_path = output_root / "clips" / f"scene_{number:02d}.mp4"
+                if _artifact_digest(clip_path) != expected_hash:
+                    return False
         elif relative == "assembly_manifest.json":
             scenes = payload.get("scenes")
             duration = payload.get("total_duration")
@@ -469,9 +584,9 @@ def run_stage(job_id: str, name: str, script: str, *args, timeout: int | None = 
         return True
     if DATABASE_CONFIGURED:
         try:
-            job_store.update_stage(job_id, stage_key, "running", worker_id=CURRENT_WORKER_ID or WORKER_ID, path=DATABASE_FILE)
+            job_store.update_stage(job_id, stage_key, "running", worker_id=CURRENT_WORKER_ID or WORKER_ID, run_id=CURRENT_RUN_ID, path=DATABASE_FILE)
         except job_store.JobStoreError as exc:
-            print(f"  [{job_id}] FAILED to claim stage {name}: {exc}")
+            print(f"  [{job_id}] FAILED to claim stage {name}: {exc.__class__.__name__}")
             return False
     cmd = [sys.executable, str(ENGINES_DIR / script), *args]
     print(f"  [{job_id}] Running: {name}")
@@ -482,10 +597,10 @@ def run_stage(job_id: str, name: str, script: str, *args, timeout: int | None = 
         def renew_lease() -> None:
             while not heartbeat_stop.wait(max(1.0, min(30.0, LEASE_SECONDS / 3))):
                 try:
-                    job_store.heartbeat(job_id, CURRENT_WORKER_ID or WORKER_ID, lease_seconds=LEASE_SECONDS, path=DATABASE_FILE)
+                    job_store.heartbeat(job_id, CURRENT_WORKER_ID or WORKER_ID, run_id=CURRENT_RUN_ID, lease_seconds=LEASE_SECONDS, path=DATABASE_FILE)
                 except job_store.JobStoreError as exc:
                     lease_lost.set()
-                    print(f"  [{job_id}] Lease heartbeat failed: {exc}", file=sys.stderr)
+                    print(f"  [{job_id}] Lease heartbeat failed: {exc.__class__.__name__}", file=sys.stderr)
                     return
         heartbeat_thread = threading.Thread(target=renew_lease, name=f"lease-{job_id}", daemon=True)
         heartbeat_thread.start()
@@ -503,69 +618,34 @@ def run_stage(job_id: str, name: str, script: str, *args, timeout: int | None = 
                     stage_key,
                     status,
                     worker_id=CURRENT_WORKER_ID or WORKER_ID,
+                    run_id=CURRENT_RUN_ID,
                     error_code="stage_failed" if status == "failed" else None,
                     error_message=message,
                     path=DATABASE_FILE,
                 )
             except job_store.JobStoreError as exc:
-                print(f"  [{job_id}] FAILED to persist {name} stage state: {exc}")
+                print(f"  [{job_id}] FAILED to persist {name} stage state: {exc.__class__.__name__}")
                 raise
 
     try:
-        stage_timeout = timeout or int(os.getenv("SOLO_STUDIO_STAGE_TIMEOUT", "300"))
+        stage_timeout = timeout or _bounded_int_env("SOLO_STUDIO_STAGE_TIMEOUT", 300, 1, 24 * 60 * 60)
         if not DATABASE_CONFIGURED:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=stage_timeout)
+            result = package_utils._run_bounded_subprocess(cmd, timeout=stage_timeout)
         else:
-            with tempfile.TemporaryFile(mode="w+b") as stdout_log, tempfile.TemporaryFile(mode="w+b") as stderr_log:
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=stdout_log,
-                    stderr=stderr_log,
-                    start_new_session=True,
-                )
-                deadline = time.monotonic() + stage_timeout
-                while process.poll() is None:
-                    if lease_lost.is_set():
-                        try:
-                            os.killpg(process.pid, signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            try:
-                                os.killpg(process.pid, signal.SIGKILL)
-                            except ProcessLookupError:
-                                pass
-                            process.wait(timeout=5)
-                        break
-                    if time.monotonic() >= deadline:
-                        try:
-                            os.killpg(process.pid, signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            try:
-                                os.killpg(process.pid, signal.SIGKILL)
-                            except ProcessLookupError:
-                                pass
-                            process.wait(timeout=5)
-                        raise subprocess.TimeoutExpired(cmd, stage_timeout)
-                    time.sleep(0.1)
-                process.wait()
-                stderr_log.seek(0)
-                stderr = stderr_log.read(8192).decode("utf-8", errors="replace")
-                result = subprocess.CompletedProcess(cmd, process.returncode, "", stderr)
+            result = package_utils._run_bounded_subprocess(cmd, timeout=stage_timeout)
     except subprocess.TimeoutExpired:
         stop_lease_heartbeat()
         print(f"  [{job_id}] FAILED: {name} timed out")
         mark("failed", "stage timeout")
         return False
+    except subprocess.SubprocessError:
+        stop_lease_heartbeat()
+        print(f"  [{job_id}] FAILED: {name}; bounded subprocess supervision failed")
+        mark("failed", "bounded subprocess supervision failed")
+        return False
     except OSError as exc:
         stop_lease_heartbeat()
-        print(f"  [{job_id}] FAILED: {name} could not start: {exc}")
+        print(f"  [{job_id}] FAILED: {name} could not start: {exc.__class__.__name__}")
         mark("failed", "stage could not start")
         return False
     if lease_lost.is_set():
@@ -575,8 +655,7 @@ def run_stage(job_id: str, name: str, script: str, *args, timeout: int | None = 
         return False
     if result.returncode != 0:
         stop_lease_heartbeat()
-        print(f"  [{job_id}] FAILED: {name}")
-        print(f"  stderr: {_safe_error(result.stderr[:500])}")
+        print(f"  [{job_id}] FAILED: {name}; stage diagnostics withheld")
         mark("failed", f"{name} exited with code {result.returncode}")
         return False
     stop_lease_heartbeat()
@@ -612,6 +691,10 @@ def process_job(job_id: str, job: dict):
     out = OUTPUT_ROOT / job_id
 
     try:
+        if DATABASE_CONFIGURED and job.get("run_id"):
+            resolved_attempt = resolve_current_attempt_output_dir(OUTPUT_ROOT, job)
+            if resolved_attempt is not None:
+                out = resolved_attempt
         _fence_lease(job_id)
         out, source_digest = _prepare_attempt_output(job_id, job)
         # Clear the durable running marker before touching retry artifacts. This
@@ -665,19 +748,23 @@ def process_job(job_id: str, job: dict):
             except job_store.LeaseLost:
                 raise
             except Exception as e:
-                print(f"  [{job_id}] Image generation not available: {e}")
+                print(f"  [{job_id}] Image generation not available: {e.__class__.__name__}")
 
         update_job(job_id, stage="voiceover", progress=0.42)
 
         # Stage 4: Voiceover — generate TTS audio
+        _update_auxiliary_stage(job_id, "voiceover", "running")
+        voiceover_generated = False
         try:
             _fence_lease(job_id)
-            update_job(job_id, has_voiceover=_run_with_lease_heartbeat(job_id, lambda: _generate_voiceover(out, sb)))
+            voiceover_generated = _run_with_lease_heartbeat(job_id, lambda: _generate_voiceover(out, sb))
+            update_job(job_id, has_voiceover=voiceover_generated)
             _fence_lease(job_id)
         except job_store.LeaseLost:
             raise
         except Exception as e:
-            print(f"  [{job_id}] Voiceover not available: {e}")
+            print(f"  [{job_id}] Voiceover not available: {e.__class__.__name__}")
+        _update_auxiliary_stage(job_id, "voiceover", "succeeded" if voiceover_generated else "skipped")
 
         update_job(job_id, stage="video_prompts", progress=0.56)
 
@@ -695,7 +782,7 @@ def process_job(job_id: str, job: dict):
                 scene_count = len(read_json_artifact(vp_path).get("scenes", []))
             except (AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError):
                 scene_count = 1
-            provider_timeout_seconds = int(os.getenv("SOLO_STUDIO_HIGGSFIELD_TIMEOUT", "900"))
+            provider_timeout_seconds = _bounded_int_env("SOLO_STUDIO_HIGGSFIELD_TIMEOUT", 900, 1, 3600)
             # Per scene: provider wait + bounded download + ffprobe verification,
             # plus a stage-level margin for process startup and serialization.
             provider_timeout = (provider_timeout_seconds + 120 + 30) * max(scene_count, 1) + 60
@@ -714,15 +801,26 @@ def process_job(job_id: str, job: dict):
             return
 
         update_job(job_id, stage="music", progress=0.72)
-        # Music is currently emitted as a prompt by the production agent; real
-        # audio generation is a later provider-integration stage.
+        _update_auxiliary_stage(job_id, "music", "running")
+        music_generated = False
+        try:
+            _fence_lease(job_id)
+            music_generated = _run_with_lease_heartbeat(job_id, lambda: _generate_music(out, sb))
+            _fence_lease(job_id)
+        except job_store.LeaseLost:
+            raise
+        except Exception as e:
+            print(f"  [{job_id}] Background music not available: {e.__class__.__name__}")
+        _update_auxiliary_stage(job_id, "music", "succeeded" if music_generated else "skipped")
 
-        update_job(job_id, stage="captions", progress=0.76)
+        update_job(job_id, stage="editing", progress=0.76)
 
         # Stage 6: Captions + Assembly
         if not run_stage(job_id, "Editing", "editing_agent.py", str(sb_path), str(out)):
             _fail_job(job_id, out, job, "Editing agent failed")
             return
+        _update_auxiliary_stage(job_id, "captions", "running")
+        _update_auxiliary_stage(job_id, "captions", "succeeded")
 
         update_job(job_id, stage="editor_export", progress=0.84)
 
@@ -739,7 +837,7 @@ def process_job(job_id: str, job: dict):
         except job_store.LeaseLost:
             raise
         except Exception as e:
-            print(f"  [{job_id}] Thumbnail: {e}")
+            print(f"  [{job_id}] Thumbnail: {e.__class__.__name__}")
 
         update_job(job_id, stage="assembly", progress=0.92)
 
@@ -761,7 +859,7 @@ def process_job(job_id: str, job: dict):
                 job_store.publish_final_media(
                     job_id,
                     CURRENT_WORKER_ID or WORKER_ID,
-                    str(job.get("run_id") or ""),
+                    CURRENT_RUN_ID or "",
                     publication=lambda: publish_verified_output(request),
                     rollback_publication=lambda: unpublish_verified_output(request),
                     evidence={
@@ -791,8 +889,9 @@ def process_job(job_id: str, job: dict):
                     final_video_plan_sha256=plan_digest,
                     final_video_duration_seconds=final_media["duration_seconds"],
                 )
+            _update_auxiliary_stage(job_id, "assembly", "succeeded" if final_media else "skipped")
         except MediaError as exc:
-            _fail_job(job_id, out, job, f"Final media assembly failed: {exc}")
+            _fail_job(job_id, out, job, f"Final media assembly failed: {exc.__class__.__name__}")
             return
 
         completed_at = datetime.now(timezone.utc).isoformat()
@@ -815,9 +914,10 @@ def process_job(job_id: str, job: dict):
             if _cancelled_cleanup(job_id, out):
                 return
             _fence_lease(job_id)
+            terminal_status = "completed" if manifest["package_status"] == "final_video_ready" else "editor_package"
             update_job(
                 job_id,
-                status="completed",
+                status=terminal_status,
                 stage="done",
                 progress=1.0,
                 completed_at=completed_at,
@@ -835,15 +935,15 @@ def process_job(job_id: str, job: dict):
         print(f"  [{job_id}] COMPLETED — {sb.get('total_duration', 0):.0f}s, {len(sb.get('scenes', []))} scenes")
 
     except Exception as e:
-        print(f"  [{job_id}] FAILED: {e}")
+        print(f"  [{job_id}] FAILED: {e.__class__.__name__}")
         try:
             _fail_job(job_id, out, job, str(e))
         except Exception as finalizer_exc:
-            print(f"  [{job_id}] FAILED to finalize job failure: {finalizer_exc}")
+            print(f"  [{job_id}] FAILED to finalize job failure: {finalizer_exc.__class__.__name__}")
             try:
                 _write_failure_reconciliation_marker(job_id, out, job, finalizer_exc)
             except Exception as marker_exc:
-                print(f"  [{job_id}] FAILED to persist failure reconciliation marker: {marker_exc}")
+                print(f"  [{job_id}] FAILED to persist failure reconciliation marker: {marker_exc.__class__.__name__}")
             raise
 
 
@@ -856,7 +956,7 @@ def _fail_job(job_id: str, out: Path, job: dict, error: str):
         # Unreadable SQLite state is not proof of cancellation. Preserve the
         # failure artifact first; terminal-state persistence will report the
         # store error separately below.
-        print(f"  [{job_id}] Could not read cancellation state: {exc}")
+        print(f"  [{job_id}] Could not read cancellation state: {exc.__class__.__name__}")
         cancelled = False
         state_unreadable = True
     if cancelled:
@@ -880,7 +980,7 @@ def _fail_job(job_id: str, out: Path, job: dict, error: str):
         try:
             write_package_manifest(out, _manifest_job_snapshot(job_id, job, status="failed", error=safe_error))
         except Exception as exc:
-            print(f"  [{job_id}] FAILED to write package manifest: {exc}")
+            print(f"  [{job_id}] FAILED to write package manifest: {exc.__class__.__name__}")
         _write_failure_reconciliation_marker(job_id, out, job, "job store could not be read while finalizing failure")
         print(f"  [{job_id}] Failure reconciliation marker written; durable job state still requires repair")
         return
@@ -921,7 +1021,7 @@ def _fail_job(job_id: str, out: Path, job: dict, error: str):
             _manifest_job_snapshot(job_id, job, status="failed", error=safe_error),
         )
     except Exception as exc:
-        print(f"  [{job_id}] FAILED to write package manifest: {exc}")
+        print(f"  [{job_id}] FAILED to write package manifest: {exc.__class__.__name__}")
         manifest = {
             "package_status": "failed",
             "has_visuals": False,
@@ -953,15 +1053,31 @@ def _manifest_job_snapshot(job_id: str, fallback: dict, **overrides) -> dict:
     snapshot = dict(fallback)
     try:
         if DATABASE_CONFIGURED:
-            latest = job_store.get_job(job_id, path=DATABASE_FILE)
+            try:
+                latest = job_store.get_job(job_id, path=DATABASE_FILE)
+            except job_store.InvalidStoreState as exc:
+                if str(exc) != "active job has no incomplete stage":
+                    raise
+                with job_store.connect(DATABASE_FILE) as connection:
+                    row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+                    latest = job_store._row_to_job(connection, row, allow_active_all_terminal=True)
         else:
             latest = load_jobs().get(job_id)
         if isinstance(latest, dict):
             snapshot.update(latest)
     except Exception as exc:
-        print(f"  [{job_id}] Could not load latest job snapshot for manifest: {exc}")
+        print(f"  [{job_id}] Could not load latest job snapshot for manifest: {exc.__class__.__name__}")
     snapshot.update(overrides)
     return snapshot
+
+
+def _normalize_profile_contract(payload: dict, label: str) -> dict:
+    if not isinstance(payload, dict):
+        raise MediaError(f"{label} output profile metadata is malformed")
+    try:
+        return validate_output_profile_contract(payload, label)
+    except (TypeError, ValueError) as exc:
+        raise MediaError(str(exc)) from exc
 
 
 def _assemble_verified_output(
@@ -982,6 +1098,10 @@ def _assemble_verified_output(
         raise MediaError("generation plan is malformed") from exc
     if not isinstance(plan, dict):
         raise MediaError("generation plan must be an object")
+    storyboard_profile = _normalize_profile_contract(storyboard, "storyboard")
+    plan_profile = _normalize_profile_contract(plan, "generation plan")
+    if storyboard_profile != plan_profile:
+        raise MediaError("storyboard and generation plan output profile metadata does not match")
     plan_scenes = plan.get("scenes")
     plan_scene_numbers = (
         [scene.get("scene_number") for scene in plan_scenes]
@@ -1064,26 +1184,56 @@ def _assemble_verified_output(
         expected_hashes[number] = digest
     if set(expected_hashes) != set(plan_scene_numbers):
         raise MediaError("generation plan clip hashes do not cover every scene")
+    expected_clip_durations: dict[str, float] = {}
+    plan_clip_durations: dict[int, float] = {}
+    for scene in plan_scenes:
+        raw_duration = scene.get("duration_seconds")
+        if isinstance(raw_duration, bool) or not isinstance(raw_duration, (int, float)):
+            raise MediaError("generation plan is missing a valid scene duration")
+        duration = float(raw_duration)
+        if not math.isfinite(duration) or duration <= 0:
+            raise MediaError("generation plan scene durations must be finite and positive")
+        plan_clip_durations[scene["scene_number"]] = duration
+    storyboard_clip_durations: dict[int, float] = {}
+    for scene in storyboard_scenes:
+        raw_duration = scene.get("duration_seconds")
+        if isinstance(raw_duration, bool) or not isinstance(raw_duration, (int, float)):
+            raise MediaError("storyboard is missing a valid scene duration")
+        duration = float(raw_duration)
+        if not math.isfinite(duration) or duration <= 0:
+            raise MediaError("storyboard scene durations must be finite and positive")
+        storyboard_clip_durations[scene["scene_number"]] = duration
+    if plan_clip_durations != storyboard_clip_durations:
+        raise MediaError("storyboard and generation plan scene durations do not match")
+    expected_clip_durations = {
+        f"scene_{number:02d}.mp4": duration
+        for number, duration in storyboard_clip_durations.items()
+    }
     raw_expected_duration = storyboard.get("total_duration")
-    expected_duration: float | None = None
-    if isinstance(raw_expected_duration, (int, float)) and not isinstance(raw_expected_duration, bool):
-        try:
-            candidate = float(raw_expected_duration)
-            if math.isfinite(candidate):
-                expected_duration = candidate
-        except (ValueError, OverflowError):
-            pass
+    if isinstance(raw_expected_duration, bool) or not isinstance(raw_expected_duration, (int, float)):
+        raise MediaError("storyboard is missing a valid total duration")
+    expected_duration = float(raw_expected_duration)
+    if not math.isfinite(expected_duration) or expected_duration <= 0:
+        raise MediaError("storyboard total duration must be finite and positive")
+    if abs(sum(storyboard_clip_durations.values()) - expected_duration) > 0.5:
+        raise MediaError("storyboard total duration does not match its scene durations")
     output = out / "final" / "video.mp4"
-    return assemble_verified_clips(
+    final_media = assemble_verified_clips(
         clips,
         output,
         expected_duration=expected_duration,
+        expected_width=plan_profile["width"],
+        expected_height=plan_profile["height"],
         lease_check=lease_check,
         publication_callback=publication_callback,
         expected_clip_sha256={
             f"scene_{number:02d}.mp4": digest for number, digest in expected_hashes.items()
         },
+        expected_clip_durations=expected_clip_durations,
     )
+    for key in ("output_profile", "aspect_ratio", "resolution"):
+        final_media[key] = plan_profile[key]
+    return final_media
 
 
 def _generate_visuals(out: Path, storyboard: dict):
@@ -1131,9 +1281,115 @@ def _generate_voiceover(out: Path, storyboard: dict):
             print(f"  [{out.name}] Voiceover generated and verified ({metadata['duration_seconds']:.2f}s)")
             return True
         except AudioGenerationError as exc:
-            print(f"  [{out.name}] Voiceover unavailable: {exc}")
+            print(f"  [{out.name}] Voiceover unavailable: {exc.__class__.__name__}")
             return False
     print(f"  [{out.name}] Would generate voiceover ({len(text)} chars — TTS disabled)")
+    return bool(_probe_media(audio).get("valid"))
+
+
+def _generate_music(out: Path, storyboard: dict):
+    """Generate an optional bounded music track and persist safe metadata."""
+    prompt_path = out / "music_prompt.txt"
+    if not prompt_path.exists():
+        return False
+
+    prompt = read_text_artifact(prompt_path)
+    raw_duration = storyboard.get("total_duration", 0)
+    if isinstance(raw_duration, bool) or not isinstance(raw_duration, (int, float)):
+        return False
+    try:
+        duration = float(raw_duration)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    if not math.isfinite(duration) or duration <= 0 or duration > 3600:
+        return False
+    duration = min(duration, 30.0)
+
+    audio_dir = out / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    audio = audio_dir / "background_music.mp3"
+    metadata_path = audio_dir / "music_metadata.json"
+    if os.getenv("SOLO_STUDIO_ENABLE_HIGGSFIELD", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        descriptor = -1
+        try:
+            metadata = generate_music(prompt, duration, audio)
+            max_audio_bytes = _bounded_int_env(
+                "SOLO_STUDIO_MAX_AUDIO_BYTES", 100 * 1024 * 1024, 1024, 2 * 1024 * 1024 * 1024
+            )
+            max_audio_duration = 30.0
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("status") != "downloaded"
+                or metadata.get("provider") != "higgsfield"
+                or metadata.get("audio_verified") is not True
+                or isinstance(metadata.get("bytes"), bool)
+                or not isinstance(metadata.get("bytes"), int)
+                or metadata["bytes"] <= 0
+                or metadata["bytes"] > max_audio_bytes
+                or isinstance(metadata.get("duration_seconds"), bool)
+                or not isinstance(metadata.get("duration_seconds"), (int, float))
+                or not math.isfinite(float(metadata["duration_seconds"]))
+                or float(metadata["duration_seconds"]) <= 0
+                or float(metadata["duration_seconds"]) > max_audio_duration
+                or not isinstance(metadata.get("artifact_identity"), tuple)
+                or len(metadata["artifact_identity"]) != 2
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in metadata["artifact_identity"])
+                or not isinstance(metadata.get("artifact_sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", metadata["artifact_sha256"]) is None
+            ):
+                raise MusicGenerationError("provider returned invalid music metadata")
+            descriptor = _open_regular_descriptor(audio)
+            file_stat = os.fstat(descriptor)
+            expected_identity = metadata["artifact_identity"]
+            if (file_stat.st_dev, file_stat.st_ino) != expected_identity:
+                raise MusicGenerationError("provider music artifact was replaced before verification")
+            probe = _probe_media(audio, _descriptor=descriptor)
+            if (
+                not probe.get("valid")
+                or probe.get("size_bytes") != metadata["bytes"]
+                or not isinstance(probe.get("duration_seconds"), (int, float))
+                or not math.isfinite(float(probe["duration_seconds"]))
+                or float(probe["duration_seconds"]) <= 0
+                or float(probe["duration_seconds"]) > max_audio_duration
+                or abs(float(probe["duration_seconds"]) - float(metadata["duration_seconds"])) > 0.5
+                or not isinstance(probe.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", probe["sha256"]) is None
+                or probe["sha256"] != metadata["artifact_sha256"]
+            ):
+                raise MusicGenerationError("provider returned an unverified music artifact")
+            canonical_stat = os.lstat(audio)
+            file_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_size != metadata["bytes"]
+                or (canonical_stat.st_dev, canonical_stat.st_ino) != expected_identity
+                or (file_stat.st_dev, file_stat.st_ino) != expected_identity
+            ):
+                raise MusicGenerationError("provider music artifact changed during verification")
+            atomic_write_json(
+                metadata_path,
+                {
+                    "status": metadata.get("status"),
+                    "provider": metadata.get("provider"),
+                    "bytes": metadata.get("bytes"),
+                    "duration_seconds": metadata.get("duration_seconds"),
+                    "audio_verified": metadata.get("audio_verified") is True,
+                    "sha256": probe["sha256"],
+                },
+            )
+            print(f"  [{out.name}] Background music generated and verified ({metadata['duration_seconds']:.2f}s)")
+            return True
+        except (MusicGenerationError, OSError, OverflowError, TypeError, ValueError) as exc:
+            print(f"  [{out.name}] Background music unavailable: {exc.__class__.__name__}")
+            return False
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    print(f"  [{out.name}] Would generate background music ({duration:.2f}s — provider disabled)")
     return bool(_probe_media(audio).get("valid"))
 
 
@@ -1145,6 +1401,9 @@ def _generate_thumbnail_for_job(out: Path, brief_json: Path):
     topic = brief.get('topic', '')
     tone = brief.get('tone', 'professional')
     dur = sb.get('total_duration', 60)
+    aspect_ratio = sb.get('aspect_ratio') or (
+        '9:16' if sb.get('output_profile') == 'vertical' else '16:9'
+    )
     hooks = {
         'educational': f"The TRUTH About {topic[:35]}",
         'professional': f"{topic[:35]} — {int(dur)}s",
@@ -1156,17 +1415,18 @@ def _generate_thumbnail_for_job(out: Path, brief_json: Path):
     prompt = (
         f"YouTube thumbnail: '{topic[:60]}'. Bold text: '{overlay}'. "
         f"Style: {brief.get('visual_style', 'professional')}. "
-        f"High contrast, vibrant, 4K, 16:9. Max 4 words."
+        f"High contrast, vibrant, 4K, {aspect_ratio}. Max 4 words."
     )
     tp = out / "thumbnail_prompt.json"
     atomic_write_json(tp, {'title_overlay': overlay, 'prompt': prompt, 'filename': 'youtube_thumbnail.png'})
 
 
 def main():
-    global CURRENT_WORKER_ID
+    global CURRENT_WORKER_ID, CURRENT_RUN_ID, OUTPUT_ROOT
     print("Solo Studio Worker — watching for queued jobs...")
     if DATABASE_CONFIGURED:
         try:
+            OUTPUT_ROOT = job_store._output_root_for_database(DATABASE_FILE)
             job_store.initialize(DATABASE_FILE)
             job_store.reconcile_expired_leases(path=DATABASE_FILE)
             abandoned = job_store.reconcile_initializing_jobs(path=DATABASE_FILE)
@@ -1179,10 +1439,10 @@ def main():
                     # A populated database or malformed legacy file is visible
                     # operational state; never silently replace SQLite data.
                     if "populated" not in str(exc):
-                        print(f"JOB_STORE_IMPORT_FAILED: {exc}", file=sys.stderr)
+                        print(f"JOB_STORE_IMPORT_FAILED: {exc.__class__.__name__}", file=sys.stderr)
                         return 2
         except job_store.JobStoreError as exc:
-            print(f"JOB_STORE_INIT_FAILED: {exc}", file=sys.stderr)
+            print(f"JOB_STORE_INIT_FAILED: {exc.__class__.__name__}", file=sys.stderr)
             return 2
         print(f"  Database: {DATABASE_FILE}")
     else:
@@ -1195,7 +1455,7 @@ def main():
                 job_store.reconcile_initializing_jobs(path=DATABASE_FILE)
                 claim = job_store.claim_next_job(WORKER_ID, lease_seconds=LEASE_SECONDS, path=DATABASE_FILE)
             except job_store.JobStoreError as exc:
-                print(f"JOB_STORE_CLAIM_FAILED: {exc}", file=sys.stderr)
+                print(f"JOB_STORE_CLAIM_FAILED: {exc.__class__.__name__}", file=sys.stderr)
                 return 2
             if claim is None:
                 time.sleep(POLL_INTERVAL)
@@ -1203,17 +1463,18 @@ def main():
             job_id = claim.job["id"]
             print(f"\n{'='*50}")
             print(f"  Processing job: {job_id}")
-            print(f"  Topic: {str(claim.job.get('topic', ''))[:80]}")
+            print(f"  Topic: {_safe_error(str(claim.job.get('topic', ''))[:80])}")
             print(f"  Duration: {claim.job.get('duration_seconds', 0)}s")
             print(f"{'='*50}")
             CURRENT_WORKER_ID = WORKER_ID
+            CURRENT_RUN_ID = claim.job.get("run_id")
             try:
                 job_store.record_worker_heartbeat(WORKER_ID, status="running", pid=os.getpid(), hostname=os.getenv("HOSTNAME"), path=DATABASE_FILE)
                 process_job(job_id, claim.job)
             except KeyboardInterrupt:
                 raise
             except job_store.JobStoreError as exc:
-                print(f"JOB_STORE_UPDATE_FAILED: {exc}", file=sys.stderr)
+                print(f"JOB_STORE_UPDATE_FAILED: {exc.__class__.__name__}", file=sys.stderr)
                 return 2
             finally:
                 try:
@@ -1221,12 +1482,13 @@ def main():
                 except job_store.JobStoreError:
                     pass
                 CURRENT_WORKER_ID = None
+                CURRENT_RUN_ID = None
             continue
 
         try:
             jobs = load_jobs()
         except (ValueError, OSError) as exc:
-            print(f"Jobs store invalid; refusing to process queued jobs until repaired: {exc}")
+            print(f"Jobs store invalid; refusing to process queued jobs until repaired: {exc.__class__.__name__}")
             time.sleep(POLL_INTERVAL)
             continue
         queued = [j for j in jobs.values() if j.get('status') == 'queued']
@@ -1235,13 +1497,13 @@ def main():
             job_id = job['id']
             print(f"\n{'='*50}")
             print(f"  Processing job: {job_id}")
-            print(f"  Topic: {job['topic'][:80]}")
+            print(f"  Topic: {_safe_error(str(job['topic'])[:80])}")
             print(f"  Duration: {job.get('duration_seconds', 0)}s")
             print(f"{'='*50}")
             try:
                 process_job(job_id, job)
             except Exception as exc:
-                print(f"  [{job_id}] Unhandled job processing error; worker will continue: {exc}")
+                print(f"  [{job_id}] Unhandled job processing error; worker will continue: {exc.__class__.__name__}")
 
         time.sleep(POLL_INTERVAL)
 
