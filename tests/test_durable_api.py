@@ -131,6 +131,13 @@ class DurableApiTests(unittest.TestCase):
         self.assertIn("free_bytes", payload["storage"])
         self.assertNotIn("token", response.text.lower())
 
+    def test_sqlite_api_listing_does_not_apply_legacy_artifact_validation(self):
+        jobs = {"modern-job": {"id": "modern-job", "status": "editor_package", "run_id": "run-1"}}
+        with patch.object(api, "_uses_legacy_json_store", return_value=False), patch.object(
+            api, "_load_jobs", return_value=jobs
+        ), patch.object(api, "_validate_job_records", side_effect=AssertionError("legacy validator called")):
+            self.assertEqual(api._load_jobs_for_api(limit=1), jobs)
+
     def test_sqlite_job_lookup_is_not_limited_by_recent_listing_window(self):
         for index in range(51):
             job_id = f"job-{index:03d}"

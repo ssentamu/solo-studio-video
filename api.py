@@ -550,8 +550,11 @@ def _public_job_response(job: dict) -> dict:
 
 def _load_jobs_for_api(*, limit: int = 50, owner_id: str | None = None) -> dict:
     try:
-        jobs = _validate_job_records(_load_jobs(limit=limit, owner_id=owner_id))
-        return _sanitize_legacy_job_records(jobs) if _uses_legacy_json_store() else jobs
+        jobs = _load_jobs(limit=limit, owner_id=owner_id)
+        if _uses_legacy_json_store():
+            jobs = _validate_job_records(jobs)
+            return _sanitize_legacy_job_records(jobs)
+        return jobs
     except (ValueError, OSError, job_store.JobStoreError) as exc:
         raise HTTPException(
             status_code=503,
