@@ -138,6 +138,27 @@ class DurableApiTests(unittest.TestCase):
         ), patch.object(api, "_validate_job_records", side_effect=AssertionError("legacy validator called")):
             self.assertEqual(api._load_jobs_for_api(limit=1), jobs)
 
+    def test_sqlite_job_listing_route_returns_durable_job(self):
+        job_id = "listed-durable-job"
+        job_store.create_job(
+            job_id,
+            {"id": job_id, "topic": "listed durable job"},
+            output_dir=api.OUTPUT_ROOT / job_id,
+            path=api.DATABASE_FILE,
+        )
+
+        response = self.client.get("/api/jobs?limit=10")
+
+        self.assertEqual(response.status_code, 200)
+        jobs = response.json()
+        self.assertEqual([job["id"] for job in jobs], [job_id])
+        self.assertEqual(jobs[0]["status"], "queued")
+        self.assertEqual(jobs[0]["package_status"], "not_started")
+        self.assertEqual(
+            [stage["stage_name"] for stage in jobs[0]["stages"]],
+            list(job_store.DEFAULT_STAGE_NAMES),
+        )
+
     def test_sqlite_job_lookup_is_not_limited_by_recent_listing_window(self):
         for index in range(51):
             job_id = f"job-{index:03d}"
