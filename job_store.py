@@ -74,7 +74,24 @@ def _payload_float(value: Any, label: str, minimum: float, maximum: float | None
     return _finite_float(value, label, minimum, maximum)
 
 
+def _validate_reference_urls(payload: Mapping[str, Any]) -> None:
+    if "reference_urls" not in payload:
+        return
+    urls = payload["reference_urls"]
+    if not isinstance(urls, list) or len(urls) > 3:
+        raise InvalidStoreState("reference_urls must be a list of at most 3 URLs")
+    from engines import source_ingest_agent
+
+    for url in urls:
+        try:
+            source_ingest_agent.validate_url_syntax(url)
+        except (source_ingest_agent.SourceIngestError, TypeError, ValueError) as exc:
+            del exc
+            raise InvalidStoreState("reference_urls contains an invalid URL")
+
+
 def _validate_payload_numbers(payload: Mapping[str, Any]) -> None:
+    _validate_reference_urls(payload)
     for field in ("duration_seconds", "final_video_duration_seconds"):
         if field in payload:
             _payload_float(payload[field], field, 0.0, 86400.0)
@@ -114,7 +131,7 @@ RESERVED_STAGE_NAMES = frozenset({"done", "waiting", "initialization", "reconcil
 
 LEGACY_INPUT_KEYS = frozenset({
     "id", "topic", "target_audience", "duration_seconds", "platform", "tone",
-    "key_messages", "visual_style", "call_to_action", "format", "chapters", "scenes",
+    "key_messages", "visual_style", "call_to_action", "reference_urls", "format", "chapters", "scenes",
     "output_profile", "aspect_ratio", "created_at", "completed_at", "error", "owner_id", "idempotency_key",
     "package_status", "final_video_sha256", "final_video_duration_seconds", "final_video_plan_sha256",
 })

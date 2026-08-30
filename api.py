@@ -33,9 +33,10 @@ from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from package_utils import LEGACY_FLAT_RUN_ID, _open_regular_descriptor, _read_secure_text_file, atomic_write_text, compute_package_status, normalize_output_profile, read_json_artifact, read_json_object, read_text_artifact, resolve_current_attempt_output_dir, update_json_file, validate_output_profile_contract, write_package_manifest
+from engines import source_ingest_agent
 
 
 def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -139,7 +140,11 @@ def _jsonable_no_nans(value):
 @app.exception_handler(RequestValidationError)
 async def _handle_request_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
     del request
-    details = _jsonable_no_nans(jsonable_encoder(exc.errors()))
+    # Pydantic errors may contain the rejected payload under ``input`` and
+    # sensitive context under ``ctx``. Neither belongs in an API response.
+    details = []
+    for error in exc.errors():
+        details.append({key: error[key] for key in ("type", "loc", "msg") if key in error})
     return JSONResponse(status_code=422, content={"detail": details})
 
 
@@ -168,6 +173,19 @@ class BriefRequest(BaseModel):
     visual_style: str = Field(default="", max_length=2000)
     call_to_action: str = Field(default="", max_length=1000)
     output_profile: str = Field(default="landscape", max_length=32)
+    reference_urls: list[str] = Field(default_factory=list, max_length=3)
+
+    @field_validator("reference_urls")
+    @classmethod
+    def validate_reference_urls(cls, value: list[str]) -> list[str]:
+        if len(value) > 3:
+            raise ValueError("reference_urls must contain at most 3 URLs")
+        for url in value:
+            try:
+                source_ingest_agent.validate_url_syntax(url)
+            except source_ingest_agent.SourceIngestError as exc:
+                raise ValueError("reference_urls must contain valid HTTP(S) URLs") from exc
+        return value
 
 
 class OperatorSessionRequest(BaseModel):
@@ -192,6 +210,7 @@ class JobStatus(BaseModel):
     key_messages: list[str] = Field(default_factory=list)
     visual_style: str = ""
     call_to_action: str = ""
+    reference_urls: list[str] = Field(default_factory=list)
     template: str = ""
     created_at: str
     completed_at: Optional[str] = None
@@ -513,7 +532,7 @@ def _sanitize_legacy_job_records(jobs: dict) -> dict:
 
 PUBLIC_JOB_KEYS = frozenset({
     "id", "topic", "target_audience", "duration_seconds", "platform", "tone",
-    "key_messages", "visual_style", "call_to_action", "template", "status",
+    "key_messages", "visual_style", "call_to_action", "reference_urls", "template", "status",
     "progress", "stage", "format", "chapters", "scenes", "created_at",
     "output_profile", "aspect_ratio",
     "completed_at", "error", "has_visuals", "has_voiceover", "has_clips",
@@ -768,6 +787,8 @@ def _open_directory_path_no_follow(path: Path) -> int:
     current_fd = os.open("/" if path.is_absolute() else ".", flags)
     try:
         for component in path.parts:
+            if component == "..":
+                raise OSError("parent traversal is not allowed")
             if component in {"", "/", "."}:
                 continue
             next_fd = os.open(component, flags, dir_fd=current_fd)
@@ -785,6 +806,12 @@ def _iter_zip_files_no_follow(root: Path, expected_root_inode: tuple[int, int] |
     file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     root_fd = _open_directory_path_no_follow(root)
     root_stat = os.fstat(root_fd)
+    source_artifacts_invalid = False
+    try:
+        marker_stat = os.lstat(".source-artifact.invalid", dir_fd=root_fd)
+        source_artifacts_invalid = True
+    except FileNotFoundError:
+        pass
     if expected_root_inode is not None and (root_stat.st_dev, root_stat.st_ino) != expected_root_inode:
         os.close(root_fd)
         raise OSError("artifact root changed during download")
@@ -804,6 +831,10 @@ def _iter_zip_files_no_follow(root: Path, expected_root_inode: tuple[int, int] |
                         or entry.name.startswith(".clips.generation-")
                         or entry.name.startswith(".clips.previous-")
                         or entry.name.startswith(".recovered-")
+                        or entry.name.startswith(".source-artifact.quarantine-")
+                        or entry.name == ".source-artifact.invalid"
+                        or (source_artifacts_invalid and not prefix and entry.name in {"source_manifest.json", "source_context.md", "reverse_brief.json"})
+                        or (entry.name.startswith(".") and ("untrusted-" in entry.name or entry.name.startswith(".quarantine-")))
                     ):
                         continue
                     if entry.is_symlink():
@@ -949,6 +980,7 @@ async def create_job(
         "key_messages": brief.key_messages,
         "visual_style": brief.visual_style,
         "call_to_action": brief.call_to_action,
+        "reference_urls": brief.reference_urls,
         "status": "initializing",
         "progress": 0.0,
         "stage": "waiting",
@@ -1031,6 +1063,15 @@ async def create_job_from_template(
     try:
         duration_seconds = _duration_minutes_to_seconds(template.get("duration_minutes", 1.0))
         output_profile = validate_output_profile_contract(template, "template")
+        reference_urls = template.get("reference_urls", [])
+        if not isinstance(reference_urls, list) or len(reference_urls) > 3:
+            raise ValueError("template reference_urls must contain at most 3 URLs")
+        for url in reference_urls:
+            try:
+                source_ingest_agent.validate_url_syntax(url)
+            except source_ingest_agent.SourceIngestError as exc:
+                del exc
+                raise ValueError("template reference_urls must contain valid HTTP(S) URLs") from None
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -1044,6 +1085,7 @@ async def create_job_from_template(
         "key_messages": template.get('key_messages', []),
         "visual_style": template.get('visual_style', ''),
         "call_to_action": template.get('call_to_action', ''),
+        "reference_urls": reference_urls,
         "template": template_id,
         "status": "initializing",
         "progress": 0.0,
@@ -1209,6 +1251,7 @@ def _write_brief_yaml(path: Path, job: dict):
         "key_messages": job.get("key_messages", []),
         "visual_style": job.get("visual_style", ""),
         "call_to_action": job.get("call_to_action", ""),
+        "reference_urls": job.get("reference_urls", []),
         "output_profile": job.get("output_profile", "landscape"),
         "aspect_ratio": job.get("aspect_ratio", "16:9"),
     }

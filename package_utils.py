@@ -96,6 +96,7 @@ def _claim_identity(identity: tuple[object, ...]) -> tuple[object, ...]:
 
 
 MAX_JSON_BYTES = 16 * 1024 * 1024
+MAX_SUBPROCESS_TIMEOUT_SECONDS = 24 * 60 * 60
 MAX_CLEANUP_CONTENT_BYTES = 256 * 1024 * 1024
 MAX_MEDIA_HASH_BYTES = 256 * 1024 * 1024
 
@@ -210,6 +211,9 @@ GENERATED_ARTIFACT_PATHS = [
     "package_manifest.json",
     "run_provenance.json",
     "failure_reconciliation.json",
+    "source_manifest.json",
+    "source_context.md",
+    "reverse_brief.json",
     "visuals",
     "audio",
     "clips",
@@ -553,9 +557,21 @@ def _run_bounded_subprocess(
     deadline: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a child with bounded stdout/stderr and a hard wall-clock deadline."""
-    if timeout <= 0 or max_output_bytes <= 0:
-        raise ValueError("subprocess limits must be positive")
-    launch_deadline = time.monotonic() + float(timeout)
+    try:
+        timeout_value = float(timeout)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError("subprocess limits are invalid")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout_value)
+        or not 0 < timeout_value <= MAX_SUBPROCESS_TIMEOUT_SECONDS
+        or isinstance(max_output_bytes, bool)
+        or not isinstance(max_output_bytes, int)
+        or max_output_bytes <= 0
+    ):
+        raise ValueError("subprocess limits are invalid")
+    launch_deadline = time.monotonic() + timeout_value
     if deadline is not None:
         if deadline <= time.monotonic():
             raise subprocess.TimeoutExpired(command, timeout)
@@ -789,6 +805,7 @@ def resolve_current_attempt_output_dir(output_root: str | Path, job: dict[str, A
 
 
 CLEANUP_HASH_MAX_SECONDS = 5.0
+PUBLICATION_CLEANUP_GRACE_SECONDS = 1.0
 
 
 def _regular_content_digest_at(
@@ -1228,21 +1245,53 @@ def _open_directory_no_follow(path: str | Path, *, create: bool = False) -> int:
     descriptor = os.open(os.sep, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
     try:
         for component in components:
+            child = -1
             try:
+                named_before_open = os.lstat(component, dir_fd=descriptor)
+                if stat.S_ISLNK(named_before_open.st_mode) or not stat.S_ISDIR(named_before_open.st_mode):
+                    raise OSError("directory component is not a regular directory")
+                child = -1
                 child = os.open(
                     component,
                     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
                     dir_fd=descriptor,
                 )
+                opened_stat = os.fstat(child)
+                named_after_open = os.lstat(component, dir_fd=descriptor)
+                if (
+                    (named_before_open.st_dev, named_before_open.st_ino) != (opened_stat.st_dev, opened_stat.st_ino)
+                    or (named_after_open.st_dev, named_after_open.st_ino) != (opened_stat.st_dev, opened_stat.st_ino)
+                ):
+                    raise OSError("directory component was replaced before it could be pinned")
             except FileNotFoundError:
                 if not create:
                     raise
                 os.mkdir(component, mode=0o770, dir_fd=descriptor)
-                child = os.open(
-                    component,
-                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=descriptor,
-                )
+                created_stat = os.lstat(component, dir_fd=descriptor)
+                if stat.S_ISLNK(created_stat.st_mode) or not stat.S_ISDIR(created_stat.st_mode):
+                    raise OSError("created path is not a directory")
+                child = -1
+                try:
+                    child = os.open(
+                        component,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=descriptor,
+                    )
+                    opened_stat = os.fstat(child)
+                    if (
+                        (created_stat.st_dev, created_stat.st_ino) != (opened_stat.st_dev, opened_stat.st_ino)
+                    ):
+                        raise OSError("created directory was replaced before it could be pinned")
+                except Exception:
+                    if child >= 0:
+                        os.close(child)
+                        child = -1
+                    raise
+            except Exception:
+                if child >= 0:
+                    os.close(child)
+                    child = -1
+                raise
             os.close(descriptor)
             descriptor = child
         return descriptor
@@ -1406,37 +1455,109 @@ def _remove_published_mismatch(
         raise OSError("published mismatch was replaced; quarantined the replacement")
     if not stat.S_ISREG(current.st_mode):
         raise OSError("published mismatch is not a regular file")
-    _remove_entry_at(directory_fd, name, expected_inode, deadline=deadline)
+    _remove_entry_at(directory_fd, name, expected_inode, deadline=deadline, verify_preclaim_ctime=False)
 
 
 def _rollback_atomic_publication(
     directory_fd: int,
     name: str,
     staging_fd: int,
+    temporary_name: str,
     backup_fd: int,
     backup_name: str,
     backup_inode: tuple[object, ...] | None,
+    backup_digest: str | None,
+    displaced_inode: tuple[object, ...] | None,
     published_inode: tuple[object, ...] | None,
     *,
     deadline: float | None = None,
-) -> None:
+) -> bool:
     """Restore the pinned prior entry after a post-replace publication failure."""
-    if deadline is not None and time.monotonic() >= deadline:
-        raise TimeoutError("atomic publication rollback deadline exceeded")
-    if published_inode is not None:
-        _remove_published_mismatch(directory_fd, name, published_inode, deadline=deadline)
-    if backup_inode is not None:
+    cleanup_deadline = deadline
+    if deadline is not None:
+        cleanup_deadline = max(deadline, time.monotonic() + PUBLICATION_CLEANUP_GRACE_SECONDS)
+    exchanged_back = False
+    if published_inode is not None and displaced_inode is not None and backup_inode is not None and temporary_name:
+        try:
+            current_stat = os.lstat(name, dir_fd=directory_fd)
+            staged_stat = os.lstat(temporary_name, dir_fd=staging_fd)
+        except FileNotFoundError:
+            current_stat = staged_stat = None
+        if (
+            current_stat is not None
+            and staged_stat is not None
+            and _identity_matches(_cleanup_identity(current_stat), published_inode)
+            and _identity_matches(_cleanup_identity(staged_stat), displaced_inode)
+        ):
+            _rename_exchange(staging_fd, temporary_name, directory_fd, name)
+            restored_stat = os.lstat(name, dir_fd=directory_fd)
+            displaced_stat = os.lstat(temporary_name, dir_fd=staging_fd)
+            if not _identity_matches(_cleanup_identity(restored_stat), displaced_inode):
+                raise OSError("atomic publication restored the wrong displaced inode")
+            if not _identity_matches(_cleanup_identity(displaced_stat), published_inode):
+                raise OSError("atomic publication rollback displaced the wrong inode")
+            if backup_digest is None:
+                raise OSError("atomic publication backup digest was not retained")
+            if _regular_content_digest_at(directory_fd, name, deadline=cleanup_deadline) != backup_digest:
+                raise OSError("atomic publication restored unexpected backup content")
+            exchanged_back = True
+    if published_inode is not None and not exchanged_back:
+        _remove_published_mismatch(directory_fd, name, published_inode, deadline=cleanup_deadline)
+    if backup_inode is not None and not exchanged_back:
         if backup_fd < 0:
             raise OSError("atomic publication backup descriptor was not retained")
+        if backup_digest is None:
+            raise OSError("atomic publication backup digest was not retained")
+        if _regular_content_digest_descriptor(backup_fd, deadline=cleanup_deadline) != backup_digest:
+            raise OSError("atomic publication backup content changed")
         os.link(f"/proc/self/fd/{backup_fd}", name, dst_dir_fd=directory_fd, follow_symlinks=True)
         restored_stat = os.lstat(name, dir_fd=directory_fd)
         if not _identity_matches(_cleanup_identity(restored_stat), backup_inode):
             raise OSError("atomic publication restored the wrong backup inode")
         if backup_name:
-            _remove_entry_at(staging_fd, backup_name, backup_inode, deadline=deadline, verify_preclaim_ctime=False)
-    if deadline is not None and time.monotonic() >= deadline:
+            _remove_entry_at(staging_fd, backup_name, backup_inode, deadline=cleanup_deadline, verify_preclaim_ctime=False)
+    if cleanup_deadline is not None and time.monotonic() >= cleanup_deadline:
         raise TimeoutError("atomic publication rollback deadline exceeded")
     os.fsync(directory_fd)
+    return exchanged_back
+
+
+def _rollback_preserving_primary(
+    primary: BaseException,
+    directory_fd: int,
+    name: str,
+    staging_fd: int,
+    temporary_name: str,
+    backup_fd: int,
+    backup_name: str,
+    backup_inode: tuple[object, ...] | None,
+    backup_digest: str | None,
+    displaced_inode: tuple[object, ...] | None,
+    published_inode: tuple[object, ...] | None,
+    *,
+    deadline: float | None = None,
+) -> bool:
+    try:
+        return _rollback_atomic_publication(
+            directory_fd, name, staging_fd, temporary_name, backup_fd, backup_name,
+            backup_inode, backup_digest, displaced_inode, published_inode, deadline=deadline,
+        )
+    except BaseException as cleanup:
+        contain_deadline = deadline
+        if deadline is not None:
+            contain_deadline = max(deadline, time.monotonic() + PUBLICATION_CLEANUP_GRACE_SECONDS)
+        if published_inode is not None:
+            try:
+                _contain_entry_at(
+                    directory_fd,
+                    name,
+                    published_inode,
+                    "atomic-publication-failure",
+                    deadline=contain_deadline,
+                )
+            except (FileNotFoundError, OSError, TimeoutError):
+                pass
+        raise primary.with_traceback(primary.__traceback__) from cleanup
 
 
 def _exchange_existing_publication(
@@ -1449,6 +1570,7 @@ def _exchange_existing_publication(
     backup_fd: int,
     backup_name: str,
     backup_inode: tuple[object, ...] | None,
+    backup_digest: str | None,
     *,
     deadline: float | None = None,
 ) -> tuple[tuple[object, ...], tuple[object, ...]]:
@@ -1459,21 +1581,28 @@ def _exchange_existing_publication(
     published_inode = temporary_inode
     try:
         displaced = _cleanup_identity(os.lstat(temporary_name, dir_fd=staging_fd))
-    except Exception:
-        _rollback_atomic_publication(
-            directory_fd, name, staging_fd, backup_fd, backup_name, backup_inode, published_inode,
-            deadline=deadline,
+    except Exception as primary:
+        _rollback_preserving_primary(
+            primary, directory_fd, name, staging_fd, temporary_name, backup_fd, backup_name,
+            backup_inode, backup_digest, expected_inode, published_inode, deadline=deadline,
         )
         raise
     if not _identity_matches(displaced, expected_inode):
+        quarantine_name = f".atomic-publication-untrusted-{os.getpid()}-{uuid.uuid4().hex}"
         try:
-            _remove_entry_at(staging_fd, temporary_name, displaced, deadline=deadline)
-        finally:
-            _rollback_atomic_publication(
-                directory_fd, name, staging_fd, backup_fd, backup_name, backup_inode, published_inode,
-            deadline=deadline,
+            _rename_noreplace(staging_fd, temporary_name, directory_fd, quarantine_name)
+        except BaseException as primary:
+            _rollback_preserving_primary(
+                primary, directory_fd, name, staging_fd, temporary_name, backup_fd, backup_name,
+                backup_inode, backup_digest, expected_inode, published_inode, deadline=deadline,
             )
-        raise OSError("destination changed during atomic exchange")
+            raise
+        _rollback_preserving_primary(
+            OSError("destination changed during atomic exchange"),
+            directory_fd, name, staging_fd, temporary_name, backup_fd, backup_name,
+            backup_inode, backup_digest, expected_inode, published_inode, deadline=deadline,
+        )
+        raise OSError("destination changed during atomic exchange; displaced entry quarantined")
     return published_inode, displaced
 
 
@@ -1483,14 +1612,24 @@ def atomic_write_json(
     *,
     _directory_lock_held: bool = False,
     deadline: float | None = None,
-) -> None:
+    _directory_fd: int | None = None,
+) -> tuple[object, ...] | None:
     """Atomically write JSON using a private descriptor-relative staging directory."""
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError("atomic JSON publication deadline exceeded")
     path = Path(path)
-    directory_fd = _open_directory_no_follow(path.parent, create=True)
+    if _directory_fd is not None:
+        if isinstance(_directory_fd, bool) or not isinstance(_directory_fd, int) or _directory_fd < 0:
+            raise ValueError("atomic publication directory descriptor is invalid")
+        directory_fd = os.dup(_directory_fd)
+    else:
+        directory_fd = _open_directory_no_follow(path.parent, create=True)
     if not _directory_lock_held:
-        _acquire_exclusive_lock(directory_fd, deadline=deadline)
+        try:
+            _acquire_exclusive_lock(directory_fd, deadline=deadline)
+        except BaseException:
+            os.close(directory_fd)
+            raise
     temporary_name = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     descriptor = -1
     temporary_inode: tuple[object, ...] | None = None
@@ -1500,10 +1639,12 @@ def atomic_write_json(
     published_inode: tuple[object, ...] | None = None
     backup_name = ""
     backup_inode: tuple[object, ...] | None = None
+    backup_digest: str | None = None
     backup_fd = -1
     existing_present = False
     existing_inode: tuple[object, ...] | None = None
     cleanup_error: Exception | None = None
+    cleanup_deadline = deadline
     temporary_cleanup_failed = False
     try:
         try:
@@ -1538,12 +1679,55 @@ def atomic_write_json(
         temporary_stat = os.fstat(descriptor)
         temporary_inode = _cleanup_identity(temporary_stat)
         if existing_present:
+            assert existing_inode is not None
             backup_name = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.backup"
-            os.link(path.name, backup_name, src_dir_fd=directory_fd, dst_dir_fd=staging_fd, follow_symlinks=False)
-            backup_fd = os.open(backup_name, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0), dir_fd=staging_fd)
-            backup_inode = _cleanup_identity(os.fstat(backup_fd))
-            if existing_inode is None or backup_inode is None or not _identity_matches(backup_inode, existing_inode):
-                raise OSError("destination changed while pinning the atomic backup")
+            source_fd = -1
+            try:
+                source_fd = os.open(
+                    path.name,
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+                source_before = os.fstat(source_fd)
+                if not _identity_matches(_cleanup_identity(source_before), existing_inode):
+                    raise OSError("destination changed while opening the atomic backup source")
+                backup_fd = os.open(
+                    backup_name,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    existing_mode or 0o600,
+                    dir_fd=staging_fd,
+                )
+                source_digest = hashlib.sha256()
+                copied = 0
+                while True:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("atomic backup deadline exceeded")
+                    chunk = os.read(source_fd, min(64 * 1024, MAX_JSON_BYTES + 1 - copied))
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > MAX_JSON_BYTES:
+                        raise ValueError(f"atomic backup exceeds the {MAX_JSON_BYTES}-byte limit")
+                    source_digest.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(backup_fd, view)
+                        if written <= 0:
+                            raise OSError("atomic backup write made no progress")
+                        view = view[written:]
+                os.fsync(backup_fd)
+                source_after = os.fstat(source_fd)
+                if not _identity_matches(_cleanup_identity(source_after), existing_inode):
+                    raise OSError("destination changed while copying the atomic backup")
+                backup_digest = source_digest.hexdigest()
+                if _regular_content_digest_descriptor(source_fd, deadline=deadline) != backup_digest:
+                    raise OSError("destination content changed while copying the atomic backup")
+                backup_inode = _cleanup_identity(os.fstat(backup_fd))
+                if backup_inode is None:
+                    raise OSError("atomic backup identity is unavailable")
+            finally:
+                if source_fd >= 0:
+                    os.close(source_fd)
         with os.fdopen(descriptor, "w", encoding="utf-8", closefd=False) as handle:
             json.dump(payload, handle, indent=2, allow_nan=False)
             handle.flush()
@@ -1565,6 +1749,7 @@ def atomic_write_json(
                 backup_fd,
                 backup_name,
                 backup_inode,
+                backup_digest,
                 deadline=deadline,
             )
         else:
@@ -1575,9 +1760,16 @@ def atomic_write_json(
             os.fsync(directory_fd)
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("atomic JSON publication deadline exceeded")
-            published_fd = _open_regular_descriptor(path)
+            if _directory_fd is not None:
+                published_fd = os.open(
+                    path.name,
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+            else:
+                published_fd = _open_regular_descriptor(path)
             try:
-                if _parse_strict_json(_read_bounded_utf8(published_fd, label="published JSON")) != payload:
+                if _parse_strict_json(_read_bounded_utf8(published_fd, label="published JSON", deadline=deadline)) != payload:
                     raise ValueError("atomic JSON publication did not match the trusted payload")
                 final_published_stat = os.lstat(path.name, dir_fd=directory_fd)
                 if not _identity_matches(_cleanup_identity(final_published_stat), published_inode):
@@ -1587,17 +1779,27 @@ def atomic_write_json(
             finally:
                 if published_fd >= 0:
                     os.close(published_fd)
-        except Exception:
-            _rollback_atomic_publication(directory_fd, path.name, staging_fd, backup_fd, backup_name, backup_inode, published_inode, deadline=deadline)
+        except Exception as primary:
+            rolled_back_via_exchange = _rollback_preserving_primary(
+                primary, directory_fd, path.name, staging_fd, temporary_name, backup_fd, backup_name,
+                backup_inode, backup_digest, existing_inode, published_inode, deadline=deadline,
+            )
+            if rolled_back_via_exchange:
+                temporary_inode = published_inode
             raise
         if backup_name and backup_inode is not None:
-            _remove_entry_at(staging_fd, backup_name, backup_inode, deadline=deadline, verify_preclaim_ctime=False)
+            _remove_entry_at(staging_fd, backup_name, backup_inode, deadline=cleanup_deadline, verify_preclaim_ctime=False)
             if backup_fd >= 0:
                 os.close(backup_fd)
                 backup_fd = -1
             backup_name = ""
             backup_inode = None
+        return published_inode
     finally:
+        cleanup_deadline = deadline
+        if deadline is not None:
+            cleanup_deadline = max(deadline, time.monotonic() + PUBLICATION_CLEANUP_GRACE_SECONDS)
+        primary_error = sys.exc_info()[1]
         if backup_fd >= 0:
             try:
                 os.close(backup_fd)
@@ -1606,7 +1808,7 @@ def atomic_write_json(
         if staging_fd >= 0:
             if temporary_inode is not None:
                 try:
-                    _remove_entry_at(staging_fd, temporary_name, temporary_inode, deadline=deadline, verify_preclaim_ctime=False)
+                    _remove_entry_at(staging_fd, temporary_name, temporary_inode, deadline=cleanup_deadline, verify_preclaim_ctime=False)
                 except FileNotFoundError:
                     pass
                 except Exception as exc:
@@ -1617,7 +1819,7 @@ def atomic_write_json(
             os.close(descriptor)
         if staging_name and staging_inode is not None and not temporary_cleanup_failed:
             try:
-                _remove_entry_at(directory_fd, staging_name, staging_inode, deadline=deadline)
+                _remove_entry_at(directory_fd, staging_name, staging_inode, deadline=cleanup_deadline)
             except FileNotFoundError:
                 pass
             except Exception as exc:
@@ -1625,11 +1827,18 @@ def atomic_write_json(
         if not _directory_lock_held:
             fcntl.flock(directory_fd, fcntl.LOCK_UN)
         os.close(directory_fd)
-        if cleanup_error is not None:
+        if cleanup_error is not None and primary_error is None:
             raise cleanup_error
 
 
-def atomic_write_text(path: str | Path, content: str, *, _directory_lock_held: bool = False, deadline: float | None = None) -> None:
+def atomic_write_text(
+    path: str | Path,
+    content: str,
+    *,
+    _directory_lock_held: bool = False,
+    deadline: float | None = None,
+    _directory_fd: int | None = None,
+) -> tuple[object, ...] | None:
     """Atomically publish bounded UTF-8 text from a private staging directory."""
     if not isinstance(content, str):
         raise TypeError("atomic text content must be a string")
@@ -1638,9 +1847,18 @@ def atomic_write_text(path: str | Path, content: str, *, _directory_lock_held: b
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError("atomic text publication deadline exceeded")
     path = Path(path)
-    directory_fd = _open_directory_no_follow(path.parent, create=True)
+    if _directory_fd is not None:
+        if isinstance(_directory_fd, bool) or not isinstance(_directory_fd, int) or _directory_fd < 0:
+            raise ValueError("atomic publication directory descriptor is invalid")
+        directory_fd = os.dup(_directory_fd)
+    else:
+        directory_fd = _open_directory_no_follow(path.parent, create=True)
     if not _directory_lock_held:
-        _acquire_exclusive_lock(directory_fd, deadline=deadline)
+        try:
+            _acquire_exclusive_lock(directory_fd, deadline=deadline)
+        except BaseException:
+            os.close(directory_fd)
+            raise
     temporary_name = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     descriptor = -1
     temporary_inode: tuple[object, ...] | None = None
@@ -1650,10 +1868,12 @@ def atomic_write_text(path: str | Path, content: str, *, _directory_lock_held: b
     published_inode: tuple[object, ...] | None = None
     backup_name = ""
     backup_inode: tuple[object, ...] | None = None
+    backup_digest: str | None = None
     backup_fd = -1
     existing_present = False
     existing_inode: tuple[object, ...] | None = None
     cleanup_error: Exception | None = None
+    cleanup_deadline = deadline
     temporary_cleanup_failed = False
     try:
         staging_name, staging_fd, captured_staging_inode = cast(
@@ -1675,12 +1895,55 @@ def atomic_write_text(path: str | Path, content: str, *, _directory_lock_held: b
         temporary_stat = os.fstat(descriptor)
         temporary_inode = _cleanup_identity(temporary_stat)
         if existing_present:
+            assert existing_inode is not None
             backup_name = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.backup"
-            os.link(path.name, backup_name, src_dir_fd=directory_fd, dst_dir_fd=staging_fd, follow_symlinks=False)
-            backup_fd = os.open(backup_name, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0), dir_fd=staging_fd)
-            backup_inode = _cleanup_identity(os.fstat(backup_fd))
-            if existing_inode is None or backup_inode is None or not _identity_matches(backup_inode, existing_inode):
-                raise OSError("destination changed while pinning the atomic backup")
+            source_fd = -1
+            try:
+                source_fd = os.open(
+                    path.name,
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+                source_before = os.fstat(source_fd)
+                if not _identity_matches(_cleanup_identity(source_before), existing_inode):
+                    raise OSError("destination changed while opening the atomic backup source")
+                backup_fd = os.open(
+                    backup_name,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=staging_fd,
+                )
+                source_digest = hashlib.sha256()
+                copied = 0
+                while True:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("atomic backup deadline exceeded")
+                    chunk = os.read(source_fd, min(64 * 1024, MAX_JSON_BYTES + 1 - copied))
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > MAX_JSON_BYTES:
+                        raise ValueError(f"atomic backup exceeds the {MAX_JSON_BYTES}-byte limit")
+                    source_digest.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(backup_fd, view)
+                        if written <= 0:
+                            raise OSError("atomic backup write made no progress")
+                        view = view[written:]
+                os.fsync(backup_fd)
+                source_after = os.fstat(source_fd)
+                if not _identity_matches(_cleanup_identity(source_after), existing_inode):
+                    raise OSError("destination changed while copying the atomic backup")
+                backup_digest = source_digest.hexdigest()
+                if _regular_content_digest_descriptor(source_fd, deadline=deadline) != backup_digest:
+                    raise OSError("destination content changed while copying the atomic backup")
+                backup_inode = _cleanup_identity(os.fstat(backup_fd))
+                if backup_inode is None:
+                    raise OSError("atomic backup identity is unavailable")
+            finally:
+                if source_fd >= 0:
+                    os.close(source_fd)
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("atomic text publication deadline exceeded")
         with os.fdopen(descriptor, "w", encoding="utf-8", closefd=False) as handle:
@@ -1702,6 +1965,7 @@ def atomic_write_text(path: str | Path, content: str, *, _directory_lock_held: b
                 backup_fd,
                 backup_name,
                 backup_inode,
+                backup_digest,
                 deadline=deadline,
             )
         else:
@@ -1712,7 +1976,14 @@ def atomic_write_text(path: str | Path, content: str, *, _directory_lock_held: b
             os.fsync(directory_fd)
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("atomic text publication deadline exceeded")
-            published_fd = _open_regular_descriptor(path)
+            if _directory_fd is not None:
+                published_fd = os.open(
+                    path.name,
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+            else:
+                published_fd = _open_regular_descriptor(path)
             try:
                 if _read_bounded_utf8(published_fd, deadline=deadline, label="published text") != content:
                     raise ValueError("atomic text publication did not match the trusted content")
@@ -1724,17 +1995,27 @@ def atomic_write_text(path: str | Path, content: str, *, _directory_lock_held: b
             finally:
                 if published_fd >= 0:
                     os.close(published_fd)
-        except Exception:
-            _rollback_atomic_publication(directory_fd, path.name, staging_fd, backup_fd, backup_name, backup_inode, published_inode, deadline=deadline)
+        except Exception as primary:
+            rolled_back_via_exchange = _rollback_preserving_primary(
+                primary, directory_fd, path.name, staging_fd, temporary_name, backup_fd, backup_name,
+                backup_inode, backup_digest, existing_inode, published_inode, deadline=deadline,
+            )
+            if rolled_back_via_exchange:
+                temporary_inode = published_inode
             raise
         if backup_name and backup_inode is not None:
-            _remove_entry_at(staging_fd, backup_name, backup_inode, deadline=deadline, verify_preclaim_ctime=False)
+            _remove_entry_at(staging_fd, backup_name, backup_inode, deadline=cleanup_deadline, verify_preclaim_ctime=False)
             if backup_fd >= 0:
                 os.close(backup_fd)
                 backup_fd = -1
             backup_name = ""
             backup_inode = None
+        return published_inode
     finally:
+        cleanup_deadline = deadline
+        if deadline is not None:
+            cleanup_deadline = max(deadline, time.monotonic() + PUBLICATION_CLEANUP_GRACE_SECONDS)
+        primary_error = sys.exc_info()[1]
         if backup_fd >= 0:
             try:
                 os.close(backup_fd)
@@ -1743,7 +2024,7 @@ def atomic_write_text(path: str | Path, content: str, *, _directory_lock_held: b
         if staging_fd >= 0:
             if temporary_inode is not None:
                 try:
-                    _remove_entry_at(staging_fd, temporary_name, temporary_inode, deadline=deadline, verify_preclaim_ctime=False)
+                    _remove_entry_at(staging_fd, temporary_name, temporary_inode, deadline=cleanup_deadline, verify_preclaim_ctime=False)
                 except FileNotFoundError:
                     pass
                 except Exception as exc:
@@ -1754,7 +2035,7 @@ def atomic_write_text(path: str | Path, content: str, *, _directory_lock_held: b
             os.close(descriptor)
         if staging_name and staging_inode is not None and not temporary_cleanup_failed:
             try:
-                _remove_entry_at(directory_fd, staging_name, staging_inode, deadline=deadline)
+                _remove_entry_at(directory_fd, staging_name, staging_inode, deadline=cleanup_deadline)
             except FileNotFoundError:
                 pass
             except Exception as exc:
@@ -1762,7 +2043,7 @@ def atomic_write_text(path: str | Path, content: str, *, _directory_lock_held: b
         if not _directory_lock_held:
             fcntl.flock(directory_fd, fcntl.LOCK_UN)
         os.close(directory_fd)
-        if cleanup_error is not None:
+        if cleanup_error is not None and primary_error is None:
             raise cleanup_error
 
 
@@ -1809,6 +2090,23 @@ def _open_lock_file(path: Path):
         raise
 
 
+
+
+def _flock_with_deadline(lock_file: Any, operation: int, deadline: float | None) -> None:
+    if deadline is None:
+        fcntl.flock(lock_file, operation)
+        return
+    while True:
+        try:
+            fcntl.flock(lock_file, operation | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("JSON lock deadline exceeded")
+            time.sleep(min(0.01, remaining))
+
+
 def read_json_object(path: str | Path, *, lock: bool = True, deadline: float | None = None) -> dict:
     """Read a JSON object, optionally under the advisory write lock."""
     path = Path(path)
@@ -1816,7 +2114,7 @@ def read_json_object(path: str | Path, *, lock: bool = True, deadline: float | N
         return _read_json_object_unlocked(path, deadline)
     lock_path = path.with_name(f"{path.name}.lock")
     with _open_lock_file(lock_path) as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_SH)
+        _flock_with_deadline(lock_file, fcntl.LOCK_SH, deadline)
         try:
             return _read_json_object_unlocked(path, deadline)
         finally:
@@ -1890,7 +2188,12 @@ def _open_regular_under_root(root: Path, path: Path) -> int:
         raise OSError("invalid rooted artifact path")
     directory_fd = _open_directory_no_follow(root, create=False)
     try:
+        pinned_root = os.fstat(directory_fd)
+        current_root = os.lstat(root)
+        if (current_root.st_dev, current_root.st_ino) != (pinned_root.st_dev, pinned_root.st_ino):
+            raise OSError("artifact root changed during rooted open")
         current_fd = directory_fd
+        descriptor = -1
         owned_directory_fds: list[int] = []
         try:
             for component in relative.parts[:-1]:
@@ -1907,9 +2210,16 @@ def _open_regular_under_root(root: Path, path: Path) -> int:
                 dir_fd=current_fd,
             )
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                os.close(descriptor)
                 raise OSError("rooted artifact is not a regular file")
+            current_root = os.lstat(root)
+            if (current_root.st_dev, current_root.st_ino) != (pinned_root.st_dev, pinned_root.st_ino):
+                raise OSError("artifact root changed during rooted open")
             return descriptor
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+                descriptor = -1
+            raise
         finally:
             for owned_fd in reversed(owned_directory_fds):
                 os.close(owned_fd)
@@ -1947,6 +2257,7 @@ def _open_regular_descriptor(path: str | Path) -> int:
     """Open one regular file through no-follow parent descriptors."""
     path = Path(path)
     directory_fd = _open_directory_no_follow(path.parent, create=False)
+    descriptor = -1
     try:
         descriptor = os.open(
             path.name,
@@ -1955,9 +2266,13 @@ def _open_regular_descriptor(path: str | Path) -> int:
         )
         file_stat = os.fstat(descriptor)
         if not stat.S_ISREG(file_stat.st_mode):
-            os.close(descriptor)
             raise OSError("media artifact is not a regular file")
         return descriptor
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+            descriptor = -1
+        raise
     finally:
         os.close(directory_fd)
 
@@ -2477,6 +2792,8 @@ def compute_package_status(
     if job_status is not None and not isinstance(job_status, str):
         job_status = None
     identity_errors: list[str] = []
+    if _safe_regular_file(root, root / ".source-artifact.invalid", deadline):
+        identity_errors.append("source artifacts are invalid; refresh required")
     provenance: dict[str, Any] = {}
     identity_required = expected_run_id != LEGACY_FLAT_RUN_ID
     if identity_required and any(value is not None for value in (expected_job_id, expected_attempt, expected_run_id, expected_source_digest)):

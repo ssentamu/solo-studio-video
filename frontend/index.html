@@ -435,6 +435,11 @@
           <label>Call to Action</label>
           <input type="text" id="cta" placeholder="e.g. Subscribe for weekly deep dives">
         </div>
+        <div class="form-group">
+          <label>Reference URL (optional)</label>
+          <input type="url" id="reference-url" placeholder="https://example.com/source material">
+          <p style="color: var(--ink-3); font-size: 12px; margin-top: 6px;">Use one public HTTP(S) page to ground the reverse brief.</p>
+        </div>
         <button type="submit" class="btn" id="submit-btn">
           <span>Generate Video</span>
         </button>
@@ -625,6 +630,8 @@ document.getElementById('brief-form').addEventListener('submit', async (e) => {
     visual_style: document.getElementById('visual-style').value,
     call_to_action: document.getElementById('cta').value,
   };
+  const referenceUrl = document.getElementById('reference-url').value.trim();
+  if (referenceUrl) body.reference_urls = [referenceUrl];
 
   try {
     const res = await protectedFetch('/jobs', {

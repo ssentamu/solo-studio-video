@@ -2,7 +2,8 @@
 """
 Solo Studio Video Pipeline — Orchestrator
 
-Runs all 7 stages:
+Runs all 8 stages (source ingestion is conditional):
+  0. Source Ingestion → Bounded URL evidence + reverse brief when references are supplied
   1. Research Agent  → Creative Brief
   2. Script Agent    → Script + Storyboard
   3. Design Agent    → Visual Prompts + Generated Images
@@ -16,10 +17,14 @@ Usage:
   python pipeline.py briefs/my_video.yaml --skip-visuals
   python pipeline.py briefs/my_video.yaml --output output/my-project
 """
-import argparse, json, subprocess, sys
+import argparse, json, os, stat, subprocess, sys
 from pathlib import Path
 
+import yaml
+
 from package_utils import (
+    _open_directory_no_follow,
+    _open_regular_descriptor,
     _run_bounded_subprocess,
     atomic_write_json,
     clear_generated_artifacts,
@@ -28,9 +33,32 @@ from package_utils import (
 )
 from media_assembly import MediaError
 from worker import _artifact_digest, _assemble_verified_output
+from engines.source_ingest_agent import MAX_REFERENCE_URLS, validate_url_syntax
 
 ENGINES = Path(__file__).resolve().parent / "engines"
 STAGE_TIMEOUT_SECONDS = 900.0
+MAX_BRIEF_BYTES = 1_048_576
+
+
+def _read_bounded_brief(path: Path) -> str:
+    descriptor = _open_regular_descriptor(path)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_BRIEF_BYTES:
+            raise ValueError("brief exceeds the bounded input limit")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, MAX_BRIEF_BYTES + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_BRIEF_BYTES:
+                raise ValueError("brief exceeds the bounded input limit")
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+    finally:
+        os.close(descriptor)
 
 
 def run_stage(name: str, script: str, *args) -> bool:
@@ -60,6 +88,47 @@ def run_stage(name: str, script: str, *args) -> bool:
     return True
 
 
+def _reference_urls_from_brief(brief_path: Path) -> list[str]:
+    """Read optional references and reject malformed CLI briefs fail-closed."""
+    try:
+        raw = yaml.safe_load(_read_bounded_brief(brief_path))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        del exc
+        raise ValueError("invalid brief") from None
+    if not isinstance(raw, dict):
+        raise ValueError("invalid brief")
+    if "reference_urls" not in raw:
+        return []
+    references = raw["reference_urls"]
+    if (
+        not isinstance(references, list)
+        or len(references) > MAX_REFERENCE_URLS
+        or any(not isinstance(url, str) for url in references)
+    ):
+        raise ValueError("invalid reference_urls")
+    try:
+        for url in references:
+            validate_url_syntax(url)
+    except Exception:
+        raise ValueError("invalid reference_urls") from None
+    return references
+
+
+def _run_source_ingestion(brief_path: Path, output_dir: Path) -> bool:
+    """Run source ingestion as a bounded subprocess before research."""
+    try:
+        reference_urls = _reference_urls_from_brief(brief_path)
+    except ValueError:
+        _fail_pipeline(output_dir, brief_path, "Source ingestion failed: invalid_brief")
+        return False
+    if not reference_urls:
+        return True
+    if not run_stage("0. Source Ingestion", "source_ingest_agent.py", str(brief_path), str(output_dir)):
+        _fail_pipeline(output_dir, brief_path, "Source ingestion failed: source_stage_failed")
+        return False
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="Solo Studio Video Pipeline")
     parser.add_argument("brief", help="Path to brief YAML file")
@@ -85,7 +154,12 @@ def main():
     else:
         out = Path("output") / brief_path.stem
 
-    out.mkdir(parents=True, exist_ok=True)
+    try:
+        output_fd = _open_directory_no_follow(out, create=True)
+        os.close(output_fd)
+    except OSError as exc:
+        print(f"Failed to prepare output directory: {exc}")
+        sys.exit(1)
     try:
         clear_generated_artifacts(out)
     except OSError as exc:
@@ -96,6 +170,9 @@ def main():
     print(f"  Brief: {brief_path}")
     print(f"  Output: {out}")
     print(f"{'#'*60}")
+
+    if not _run_source_ingestion(brief_path, out):
+        return
 
     # Stage 1: Research
     if not run_stage("1. Research Agent", "research_agent.py", str(brief_path), str(out)):

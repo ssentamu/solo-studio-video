@@ -11,6 +11,7 @@ from typing import Callable
 
 import job_store
 import package_utils
+from engines import source_ingest_agent
 from audio_generation import AudioGenerationError, generate_voiceover
 from media_assembly import MediaError, PublicationRequest, assemble_verified_clips, publish_verified_output, unpublish_verified_output
 from music_generation import MusicGenerationError, generate_music
@@ -556,7 +557,14 @@ def _resume_artifacts_valid(
     return True
 
 
-def run_stage(job_id: str, name: str, script: str, *args, timeout: int | None = None) -> bool:
+def run_stage(
+    job_id: str,
+    name: str,
+    script: str,
+    *args,
+    timeout: int | None = None,
+    durable: bool = True,
+) -> bool:
     """Run a pipeline stage and update job progress."""
     if _job_is_cancelled(job_id):
         print(f"  [{job_id}] CANCELLED before {name}")
@@ -565,7 +573,7 @@ def run_stage(job_id: str, name: str, script: str, *args, timeout: int | None = 
     output_root = Path(str(args[-1])) if args else None
     required = STAGE_REQUIRED_FILES.get(stage_key, ())
     resume_verified = False
-    if DATABASE_CONFIGURED:
+    if durable and DATABASE_CONFIGURED:
         try:
             existing = job_store.get_job(job_id, path=DATABASE_FILE)
             stage_rows = {row.get("stage_name"): row for row in (existing or {}).get("stages", [])}
@@ -582,7 +590,7 @@ def run_stage(job_id: str, name: str, script: str, *args, timeout: int | None = 
     if resume_verified:
         _fence_lease(job_id)
         return True
-    if DATABASE_CONFIGURED:
+    if durable and DATABASE_CONFIGURED:
         try:
             job_store.update_stage(job_id, stage_key, "running", worker_id=CURRENT_WORKER_ID or WORKER_ID, run_id=CURRENT_RUN_ID, path=DATABASE_FILE)
         except job_store.JobStoreError as exc:
@@ -611,7 +619,7 @@ def run_stage(job_id: str, name: str, script: str, *args, timeout: int | None = 
             heartbeat_thread.join(timeout=2.0)
 
     def mark(status: str, message: str | None = None) -> None:
-        if DATABASE_CONFIGURED:
+        if durable and DATABASE_CONFIGURED:
             try:
                 job_store.update_stage(
                     job_id,
@@ -706,10 +714,33 @@ def process_job(job_id: str, job: dict):
         # or stage outputs.
         clear_generated_artifacts(out)
         _ensure_run_provenance(out, job_id, job.get("attempt"), job.get("run_id"))
+        brief_yaml = out / "brief.yaml"
+
+        # Stage 0: Source ingestion → bounded provenance + reverse brief.
+        if "reference_urls" in job:
+            reference_urls = job["reference_urls"]
+            if not isinstance(reference_urls, list) or len(reference_urls) > source_ingest_agent.MAX_REFERENCE_URLS:
+                raise ValueError("reference_urls must be a list of at most 3 URLs")
+            for reference_url in reference_urls:
+                source_ingest_agent.validate_url_syntax(reference_url)
+        else:
+            reference_urls = []
+        if reference_urls:
+            update_job(job_id, status="running", stage="research", progress=0.05)
+            if not run_stage(
+                job_id,
+                "Source Ingestion",
+                "source_ingest_agent.py",
+                str(brief_yaml),
+                str(out),
+                timeout=120,
+                durable=False,
+            ):
+                _fail_job(job_id, out, job, "Source ingestion failed")
+                return
 
         # Stage 1: Research → Creative Brief
         update_job(job_id, status="running", stage="research", progress=0.05)
-        brief_yaml = out / "brief.yaml"
         if not run_stage(job_id, "Research", "research_agent.py", str(brief_yaml), str(out)):
             _fail_job(job_id, out, job, "Research agent failed")
             return

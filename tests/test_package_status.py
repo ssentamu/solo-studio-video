@@ -1352,7 +1352,7 @@ class PipelineFlowTests(unittest.TestCase):
     def test_pipeline_rerun_clears_stale_visuals_when_visuals_are_skipped(self):
         import pipeline
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch("pipeline._run_source_ingestion"):
             out = Path(tmp)
             (out / "visuals").mkdir()
             (out / "visuals" / "scene_01.png").write_bytes(b"old image")
@@ -1376,7 +1376,7 @@ class PipelineFlowTests(unittest.TestCase):
     def test_pipeline_fails_closed_when_deterministic_stage_fails(self):
         import pipeline
 
-        with tempfile.TemporaryDirectory() as tmp, patch(
+        with tempfile.TemporaryDirectory() as tmp, patch("pipeline._run_source_ingestion"), patch(
             "pipeline.run_stage", side_effect=[True, True, False]
         ):
             old_argv = sys.argv[:]
@@ -1409,7 +1409,7 @@ class PipelineFlowTests(unittest.TestCase):
                     (Path(tmp) / "video_prompts.json").write_text(json.dumps({"scenes": []}))
                 return True
 
-            patchers = patch("pipeline.run_stage", side_effect=fake_run_stage), patch(
+            patchers = patch("pipeline._run_source_ingestion"), patch("pipeline.run_stage", side_effect=fake_run_stage), patch(
             "pipeline._generate_thumbnail_prompt", return_value=None
             ), patch("pipeline.write_package_manifest", side_effect=OSError("disk full"))
             old_argv = sys.argv[:]
@@ -1420,7 +1420,7 @@ class PipelineFlowTests(unittest.TestCase):
                 "-o",
                 tmp,
             ]
-            with patchers[0], patchers[1], patchers[2]:
+            with patchers[0], patchers[1], patchers[2], patchers[3]:
                 try:
                     with self.assertRaises(SystemExit) as exc:
                         pipeline.main()
